@@ -1,0 +1,3 @@
+rate(chrony_serverstats_ntp_packets_received_total[5m])
+-
+rate(chrony_serverstats_ntp_packets_dropped_total[5m])

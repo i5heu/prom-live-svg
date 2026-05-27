@@ -6,18 +6,73 @@ Ultra-high-performance Go service that compiles Prometheus metrics into static S
   <img width="400" height="400" style="border-radius: 3%; max-width: 100%" alt="Logo of OuroborosDB" src=".media/Dürer_Melancholia_I.jpg">
 </p>
 
-## Usage (TODO)
+## Usage
 
 `prom-live-svg` will query Prometheus every 15 seconds, compile the configured metrics into SVG and json charts, and serve them on an HTTP endpoint. The browser will load the svg chart on start and then every 15 seconds the new data will be loaded and will be added to the svg chart adding 1 data point every 1 seconds. The browser will always request 15 seconds absolutes like Unix Time: `1779890900`, `1779890915`, `1779890930`, this simplyfies caching and makes it possible to use a CDN to cache the charts and json.
 
-- js
-- container
-  - config
-  - testing
+Current bootstrap includes:
+
+- Go module and runnable entrypoint in `cmd/prom-live-svg`
+- Config loading from YAML or JSON files
+- Environment variable overrides for core settings
+- Config validation for HTTP, Prometheus, cache, logging, and chart definitions
+- Minimal HTTP server with `/healthz` and `/readyz`
+- Example config in `configs/example.yaml`
+- Chart queries defined inline with YAML multiline strings or external `.promql` files
+
+### Quick start
+
+```bash
+go run ./cmd/prom-live-svg -check-config -config configs/example.yaml
+go run ./cmd/prom-live-svg -config configs/example.yaml
+```
+
+### Chart query definitions
+
+Chart queries can be defined directly in YAML with a multiline block:
+
+```yaml
+charts:
+  - name: chrony_packets_accepted
+    query: |-
+      rate(chrony_serverstats_ntp_packets_received_total[5m])
+      -
+      rate(chrony_serverstats_ntp_packets_dropped_total[5m])
+```
+
+Or loaded from a separate file relative to the config file location:
+
+```yaml
+charts:
+  - name: chrony_packets_accepted
+    query_file: queries/chrony_packets_accepted.promql
+```
+
+Use exactly one of `query` or `query_file` per chart.
+
+### Environment overrides
+
+The config loader supports these environment variables:
+
+- `PROM_LIVE_SVG_SERVICE_NAME`
+- `PROM_LIVE_SVG_SERVICE_ENVIRONMENT`
+- `PROM_LIVE_SVG_HTTP_LISTEN_ADDR`
+- `PROM_LIVE_SVG_HTTP_READ_HEADER_TIMEOUT`
+- `PROM_LIVE_SVG_HTTP_READ_TIMEOUT`
+- `PROM_LIVE_SVG_HTTP_WRITE_TIMEOUT`
+- `PROM_LIVE_SVG_HTTP_IDLE_TIMEOUT`
+- `PROM_LIVE_SVG_HTTP_SHUTDOWN_TIMEOUT`
+- `PROM_LIVE_SVG_PROMETHEUS_BASE_URL`
+- `PROM_LIVE_SVG_PROMETHEUS_QUERY_TIMEOUT`
+- `PROM_LIVE_SVG_GENERATION_INTERVAL`
+- `PROM_LIVE_SVG_CACHE_RETENTION`
+- `PROM_LIVE_SVG_STORAGE_DATA_DIR`
+- `PROM_LIVE_SVG_LOG_LEVEL`
+- `PROM_LIVE_SVG_LOG_FORMAT`
 
 ## TODO
 
-- [ ] Golang base structure and configuration system
+- [x] Golang base structure and configuration system
 - [ ] test data and configurations
 - [ ] http server basic setup
   - [ ] http must hold a connection if it is a valid 1/4 of a minute until the svg or json is available, then it should serve the svg and json charts in said request, so we can handle browsers that have a fast running clock.
