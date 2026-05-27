@@ -1,0 +1,3 @@
+avg by (source_name) (
+  chrony_sources_last_sample_offset_seconds{job="chrony-exporter",instance="chrony.example:9123"}
+)

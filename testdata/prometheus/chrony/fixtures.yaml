@@ -1,0 +1,15 @@
+dataset: chrony
+kind: prometheus-query-range-fixtures
+sanitized: true
+entries:
+  - name: chrony_packets_accepted
+    query_file: queries/chrony_packets_accepted.promql
+    response_file: chrony_packets_accepted.range.json
+
+  - name: chrony_timestamp_span
+    query_file: queries/chrony_timestamp_span.promql
+    response_file: chrony_timestamp_span.range.json
+
+  - name: chrony_source_offset_by_source
+    query_file: queries/chrony_source_offset_by_source.promql
+    response_file: chrony_source_offset_by_source.range.json

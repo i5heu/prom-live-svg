@@ -1,0 +1,1 @@
+chrony_serverstats_ntp_timestamp_span_seconds{job="chrony-exporter",instance="chrony.example:9123"}
