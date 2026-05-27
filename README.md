@@ -10,15 +10,6 @@ Ultra-high-performance Go service that compiles Prometheus metrics into static S
 
 `prom-live-svg` will query Prometheus every 15 seconds, compile the configured metrics into SVG and json charts, and serve them on an HTTP endpoint. The browser will load the svg chart on start and then every 15 seconds the new data will be loaded and will be added to the svg chart adding 1 data point every 1 seconds. The browser will always request 15 seconds absolutes like Unix Time: `1779890900`, `1779890915`, `1779890930`, this simplyfies caching and makes it possible to use a CDN to cache the charts and json.
 
-Current bootstrap includes:
-
-- Go module and runnable entrypoint in `cmd/prom-live-svg`
-- Config loading from YAML or JSON files
-- Environment variable overrides for core settings
-- Config validation for HTTP, Prometheus, cache, logging, and chart definitions
-- Minimal HTTP server with `/healthz` and `/readyz`
-- Example config in `configs/example.yaml`
-- Chart queries defined inline with YAML multiline strings or external `.promql` files
 
 ### Quick start
 
@@ -73,7 +64,7 @@ The config loader supports these environment variables:
 ## TODO
 
 - [x] Golang base structure and configuration system
-- [ ] test data and configurations
+- [x] test data and configurations
 - [ ] http server basic setup
   - [ ] http must hold a connection if it is a valid 1/4 of a minute until the svg or json is available, then it should serve the svg and json charts in said request, so we can handle browsers that have a fast running clock.
 - [ ] caching setup for svg and json charts
