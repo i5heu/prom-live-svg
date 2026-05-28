@@ -28,6 +28,28 @@ logging:
     format: text
 
 charts:
+    - name: chrony_requests_summary
+      title: Chrony requests
+      query_file: queries/chrony_packets_accepted.promql
+      lookback: 5m
+      step: 15s
+      width: 800
+      height: 320
+      stats:
+          - name: all_time_requests
+            label: All time requests
+            query_file: queries/chrony_packets_total.promql
+            lookback: 15s
+            step: 15s
+            decimals: 0
+          - name: requests_per_second
+            label: Req/s
+            query_file: queries/chrony_packets_accepted.promql
+            lookback: 15s
+            step: 15s
+            decimals: 2
+            unit: req/s
+
     - name: chrony_packets_accepted_inline
       title: Chrony packets accepted (inline)
       query: |-

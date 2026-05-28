@@ -44,16 +44,29 @@ type svgTemplateData struct {
 	CenterY         string
 	MaxLabel        string
 	MinLabel        string
+	TitleY          string
+	StatLabelY      string
+	StatValueY      string
 	StartAt         int64
 	EndAt           int64
 	HasData         bool
+	HasStats        bool
 	Series          []svgSeriesData
+	Stats           []svgStatData
 }
 
 // svgSeriesData holds the rendering data for a single data series in the SVG.
 type svgSeriesData struct {
-	Color  string
-	Points string
+	Color         string
+	Points        string
+	StrokeWidth   string
+	StrokeOpacity string
+}
+
+type svgStatData struct {
+	Label     string
+	Formatted string
+	X         string
 }
 
 // buildSVGData converts a Document into svgTemplateData suitable for template rendering.
@@ -84,6 +97,7 @@ func buildSVGData(doc Document) svgTemplateData { // A
 		end = start + 1
 	}
 
+	hasStats := len(doc.Stats) > 0
 	data := svgTemplateData{
 		Width:           doc.Width,
 		Height:          doc.Height,
@@ -99,34 +113,71 @@ func buildSVGData(doc Document) svgTemplateData { // A
 		CenterY:         formatFloat(topPad + plotHeight/2),
 		MaxLabel:        formatFloat(maxValue),
 		MinLabel:        formatFloat(minValue),
+		TitleY:          formatFloat(20),
+		StatLabelY:      formatFloat(58),
+		StatValueY:      formatFloat(92),
 		StartAt:         doc.StartAt,
 		EndAt:           doc.EndAt,
 		HasData:         hasData,
+		HasStats:        hasStats,
 	}
 
-	if hasData {
-		data.Series = make([]svgSeriesData, 0, len(doc.Series))
-		for i, series := range doc.Series {
-			if len(series.Values) == 0 {
-				continue
-			}
+	data.Series = buildSVGSeries(doc, start, end, leftPad, topPad, plotWidth, plotHeight, maxValue, minValue, hasStats)
 
-			color := palette[i%len(palette)]
-			points := make([]string, 0, len(series.Values))
-			for _, point := range series.Values {
-				x := leftPad + ((float64(point.Timestamp)-start)/(end-start))*plotWidth
-				y := topPad + ((maxValue-point.Value)/(maxValue-minValue))*plotHeight
-				points = append(points, formatFloat(x)+","+formatFloat(y))
-			}
+	if hasStats {
+		data.Stats = make([]svgStatData, 0, len(doc.Stats))
+		slotWidth := plotWidth
+		if len(doc.Stats) > 0 {
+			slotWidth = plotWidth / float64(len(doc.Stats))
+		}
 
-			data.Series = append(data.Series, svgSeriesData{
-				Color:  color,
-				Points: joinPoints(points),
+		for i, stat := range doc.Stats {
+			data.Stats = append(data.Stats, svgStatData{
+				Label:     stat.Label,
+				Formatted: stat.Formatted,
+				X:         formatFloat(leftPad + float64(i)*slotWidth),
 			})
 		}
 	}
 
 	return data
+}
+
+func buildSVGSeries(doc Document, start float64, end float64, leftPad float64, topPad float64, plotWidth float64, plotHeight float64, maxValue float64, minValue float64, hasStats bool) []svgSeriesData { // A
+	if len(doc.Series) == 0 {
+		return nil
+	}
+
+	strokeWidth := formatFloat(2)
+	strokeOpacity := formatFloat(1)
+	if hasStats {
+		strokeWidth = formatFloat(3)
+		strokeOpacity = formatFloat(0.18)
+	}
+
+	seriesData := make([]svgSeriesData, 0, len(doc.Series))
+	for i, series := range doc.Series {
+		if len(series.Values) == 0 {
+			continue
+		}
+
+		color := palette[i%len(palette)]
+		points := make([]string, 0, len(series.Values))
+		for _, point := range series.Values {
+			x := leftPad + ((float64(point.Timestamp)-start)/(end-start))*plotWidth
+			y := topPad + ((maxValue-point.Value)/(maxValue-minValue))*plotHeight
+			points = append(points, formatFloat(x)+","+formatFloat(y))
+		}
+
+		seriesData = append(seriesData, svgSeriesData{
+			Color:         color,
+			Points:        joinPoints(points),
+			StrokeWidth:   strokeWidth,
+			StrokeOpacity: strokeOpacity,
+		})
+	}
+
+	return seriesData
 }
 
 // executeSVGTemplate renders the SVG template with the given data and returns the result.

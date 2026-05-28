@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"prom-live-svg/internal/config"
@@ -22,11 +23,19 @@ type Document struct {
 	Width       int      `json:"width"`
 	Height      int      `json:"height"`
 	Series      []Series `json:"series"`
+	Stats       []Stat   `json:"stats,omitempty"`
 }
 
 type Series struct {
 	Metric map[string]string `json:"metric"`
 	Values []Point           `json:"values"`
+}
+
+type Stat struct {
+	Name      string  `json:"name"`
+	Label     string  `json:"label"`
+	Value     float64 `json:"value"`
+	Formatted string  `json:"formatted"`
 }
 
 type Point struct {
@@ -46,6 +55,10 @@ var palette = []string{
 }
 
 func BuildDocument(chart config.ChartConfig, end time.Time, matrix prometheus.Matrix) Document { // A
+	return BuildDocumentWithStats(chart, end, matrix, nil)
+}
+
+func BuildDocumentWithStats(chart config.ChartConfig, end time.Time, matrix prometheus.Matrix, stats []Stat) Document { // A
 	start := end.Add(-chart.Lookback.Duration)
 	doc := Document{
 		Kind:        "prometheus_matrix_chart",
@@ -58,6 +71,7 @@ func BuildDocument(chart config.ChartConfig, end time.Time, matrix prometheus.Ma
 		Width:       chart.Width,
 		Height:      chart.Height,
 		Series:      make([]Series, 0, len(matrix.Series)),
+		Stats:       cloneStats(stats),
 	}
 
 	for _, inputSeries := range matrix.Series {
@@ -77,6 +91,20 @@ func BuildDocument(chart config.ChartConfig, end time.Time, matrix prometheus.Ma
 	}
 
 	return doc
+}
+
+func BuildStat(cfg config.ChartStatConfig, matrix prometheus.Matrix) (Stat, error) { // A
+	value, ok := latestAggregateValue(matrix)
+	if !ok {
+		return Stat{}, fmt.Errorf("stat query returned no samples")
+	}
+
+	return Stat{
+		Name:      cfg.Name,
+		Label:     cfg.Label,
+		Value:     value,
+		Formatted: formatStatValue(value, cfg.Decimals, cfg.Unit),
+	}, nil
 }
 
 func MarshalJSON(doc Document) ([]byte, error) { // A
@@ -148,6 +176,31 @@ func cloneMetric(metric map[string]string) map[string]string { // A
 	return cloned
 }
 
+func cloneStats(stats []Stat) []Stat { // A
+	if len(stats) == 0 {
+		return nil
+	}
+
+	cloned := make([]Stat, len(stats))
+	copy(cloned, stats)
+	return cloned
+}
+
+func latestAggregateValue(matrix prometheus.Matrix) (float64, bool) { // A
+	total := 0.0
+	hasData := false
+
+	for _, series := range matrix.Series {
+		if len(series.Values) == 0 {
+			continue
+		}
+		total += series.Values[len(series.Values)-1].Value
+		hasData = true
+	}
+
+	return total, hasData
+}
+
 func joinPoints(points []string) string { // A
 	if len(points) == 0 {
 		return ""
@@ -162,4 +215,18 @@ func joinPoints(points []string) string { // A
 
 func formatFloat(value float64) string { // A
 	return strconv.FormatFloat(value, 'f', 3, 64)
+}
+
+func formatStatValue(value float64, decimals int, unit string) string { // A
+	if decimals < 0 {
+		decimals = 0
+	}
+
+	formatted := strconv.FormatFloat(value, 'f', decimals, 64)
+	unit = strings.TrimSpace(unit)
+	if unit == "" {
+		return formatted
+	}
+
+	return formatted + " " + unit
 }

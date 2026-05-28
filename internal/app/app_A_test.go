@@ -216,6 +216,100 @@ func TestHandleChartRejectsUnalignedTimestamp(t *testing.T) { // A
 	}
 }
 
+func TestHandleChartJSONIncludesStats(t *testing.T) { // A
+	t.Parallel()
+
+	cfg := loadFixtureConfig(t)
+	cfg.Charts = []config.ChartConfig{
+		{
+			Name:     "chrony_requests_summary",
+			Title:    "Chrony requests",
+			Query:    "rate(chrony_serverstats_ntp_packets_received_total[5m]) - rate(chrony_serverstats_ntp_packets_dropped_total[5m])",
+			Width:    800,
+			Height:   320,
+			Lookback: config.Duration{Duration: 5 * time.Minute},
+			Step:     config.Duration{Duration: 15 * time.Second},
+			Stats: []config.ChartStatConfig{
+				{
+					Name:     "all_time_requests",
+					Label:    "All time requests",
+					Query:    "chrony_serverstats_ntp_packets_received_total - chrony_serverstats_ntp_packets_dropped_total",
+					Lookback: config.Duration{Duration: 15 * time.Second},
+					Step:     config.Duration{Duration: 15 * time.Second},
+					Decimals: 0,
+				},
+				{
+					Name:     "requests_per_second",
+					Label:    "Req/s",
+					Query:    "rate(chrony_serverstats_ntp_packets_received_total[5m]) - rate(chrony_serverstats_ntp_packets_dropped_total[5m])",
+					Lookback: config.Duration{Duration: 15 * time.Second},
+					Step:     config.Duration{Duration: 15 * time.Second},
+					Decimals: 2,
+					Unit:     "req/s",
+				},
+			},
+		},
+	}
+
+	backgroundQuery := cfg.Charts[0].Query
+	totalQuery := cfg.Charts[0].Stats[0].Query
+	querier := &fixtureQuerier{
+		matricesByQuery: map[string]promapi.Matrix{
+			backgroundQuery: {
+				Series: []promapi.Series{
+					{
+						Metric: map[string]string{"instance": "chrony.example:9123"},
+						Values: []promapi.Sample{
+							{Timestamp: time.Unix(1779896065, 0).UTC(), Value: 318.2},
+							{Timestamp: time.Unix(1779896215, 0).UTC(), Value: 333.4},
+							{Timestamp: time.Unix(1779896355, 0).UTC(), Value: 340.51},
+						},
+					},
+				},
+			},
+			totalQuery: {
+				Series: []promapi.Series{
+					{
+						Metric: map[string]string{"instance": "chrony.example:9123"},
+						Values: []promapi.Sample{
+							{Timestamp: time.Unix(1779896340, 0).UTC(), Value: 145670},
+							{Timestamp: time.Unix(1779896355, 0).UTC(), Value: 145678},
+						},
+					},
+				},
+			},
+		},
+	}
+	application := newTestApp(cfg, querier)
+
+	request := httptest.NewRequest(http.MethodGet, "/charts/chrony_requests_summary/1779896355.json", nil)
+	response := httptest.NewRecorder()
+
+	application.server.Handler.ServeHTTP(response, request)
+
+	if got, want := response.Code, http.StatusOK; got != want {
+		t.Fatalf("unexpected status: got %d want %d", got, want)
+	}
+
+	var document charts.Document
+	if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil {
+		t.Fatalf("decode response JSON: %v", err)
+	}
+
+	if got, want := len(document.Stats), 2; got != want {
+		t.Fatalf("unexpected stat count: got %d want %d", got, want)
+	}
+	if got, want := document.Stats[0].Formatted, "145678"; got != want {
+		t.Fatalf("unexpected formatted total stat: got %q want %q", got, want)
+	}
+	if got, want := document.Stats[1].Formatted, "340.51 req/s"; got != want {
+		t.Fatalf("unexpected formatted rate stat: got %q want %q", got, want)
+	}
+	if got, want := querier.callCount, 3; got != want {
+		t.Fatalf("unexpected querier call count: got %d want %d", got, want)
+	}
+}
+
 func TestHandleChartReturnsNotFoundForUnknownChart(t *testing.T) { // A
 	t.Parallel()
 
@@ -309,9 +403,13 @@ func newFixtureQuerier(t *testing.T, datasetPath string) *fixtureQuerier { // A
 }
 
 func (f *fixtureQuerier) QueryChartRange(_ context.Context, chart config.ChartConfig, _ time.Time) (promapi.Matrix, error) { // A
+	return f.QueryRange(context.Background(), promapi.RangeQuery{Query: chart.Query})
+}
+
+func (f *fixtureQuerier) QueryRange(_ context.Context, query promapi.RangeQuery) (promapi.Matrix, error) { // A
 	f.callCount++
 
-	matrix, ok := f.matricesByQuery[strings.TrimSpace(chart.Query)]
+	matrix, ok := f.matricesByQuery[strings.TrimSpace(query.Query)]
 	if !ok {
 		return promapi.Matrix{}, context.DeadlineExceeded
 	}

@@ -146,6 +146,62 @@ func TestLoadRejectsInlineAndFileQueryCombination(t *testing.T) { // A
 	}
 }
 
+func TestLoadReadsChartStatQueryFilesRelativeToConfig(t *testing.T) { // A
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	queriesDir := filepath.Join(tempDir, "queries")
+	if err := os.MkdirAll(queriesDir, 0o755); err != nil {
+		t.Fatalf("create queries dir: %v", err)
+	}
+
+	historyQueryPath := filepath.Join(queriesDir, "history.promql")
+	if err := os.WriteFile(historyQueryPath, []byte("rate(up[5m])\n"), 0o644); err != nil {
+		t.Fatalf("write history query file: %v", err)
+	}
+
+	statQueryPath := filepath.Join(queriesDir, "total.promql")
+	if err := os.WriteFile(statQueryPath, []byte("sum(up)\n"), 0o644); err != nil {
+		t.Fatalf("write stat query file: %v", err)
+	}
+
+	configPath := filepath.Join(tempDir, "config.yaml")
+	configBody := `prometheus:
+  base_url: https://prometheus.example.com
+charts:
+  - name: req_summary
+    query_file: queries/history.promql
+    step: 15s
+    stats:
+      - name: total_requests
+        query_file: queries/total.promql
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if got, want := cfg.Charts[0].Query, "rate(up[5m])"; got != want {
+		t.Fatalf("unexpected chart query: got %q want %q", got, want)
+	}
+	if got, want := cfg.Charts[0].Stats[0].Query, "sum(up)"; got != want {
+		t.Fatalf("unexpected stat query: got %q want %q", got, want)
+	}
+	if got, want := cfg.Charts[0].Stats[0].Label, "total_requests"; got != want {
+		t.Fatalf("unexpected default stat label: got %q want %q", got, want)
+	}
+	if got, want := cfg.Charts[0].Stats[0].Lookback.Duration, 15*time.Second; got != want {
+		t.Fatalf("unexpected default stat lookback: got %s want %s", got, want)
+	}
+	if got, want := cfg.Charts[0].Stats[0].Step.Duration, 15*time.Second; got != want {
+		t.Fatalf("unexpected default stat step: got %s want %s", got, want)
+	}
+}
+
 func TestLoadRejectsDuplicateCharts(t *testing.T) { // A
 	t.Parallel()
 

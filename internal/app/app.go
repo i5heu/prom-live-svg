@@ -21,6 +21,7 @@ import (
 
 type chartQuerier interface {
 	QueryChartRange(ctx context.Context, chart config.ChartConfig, end time.Time) (prometheus.Matrix, error)
+	QueryRange(ctx context.Context, query prometheus.RangeQuery) (prometheus.Matrix, error)
 }
 
 type App struct {
@@ -193,14 +194,12 @@ func (a *App) handleChartRequest(w http.ResponseWriter, r *http.Request) { // A
 		return
 	}
 
-	matrix, err := a.querier.QueryChartRange(r.Context(), chart, requestedAt)
+	document, err := a.loadChartDocument(r.Context(), chart, requestedAt)
 	if err != nil {
-		a.logger.Error("query chart range failed", "chart", chart.Name, "requested_at", requestedAt.Unix(), "err", err)
+		a.logger.Error("load chart document failed", "chart", chart.Name, "requested_at", requestedAt.Unix(), "err", err)
 		http.Error(w, "failed to query chart data", http.StatusBadGateway)
 		return
 	}
-
-	document := charts.BuildDocument(chart, requestedAt, matrix)
 
 	switch format {
 	case "json":
@@ -343,6 +342,47 @@ func (a *App) waitForRequestedTimestamp(ctx context.Context, target time.Time) e
 	}
 }
 
+func (a *App) loadChartDocument(ctx context.Context, chart config.ChartConfig, requestedAt time.Time) (charts.Document, error) { // A
+	matrix, err := a.querier.QueryChartRange(ctx, chart, requestedAt)
+	if err != nil {
+		return charts.Document{}, fmt.Errorf("query chart range: %w", err)
+	}
+
+	stats, err := a.queryChartStats(ctx, chart, requestedAt)
+	if err != nil {
+		return charts.Document{}, err
+	}
+
+	return charts.BuildDocumentWithStats(chart, requestedAt, matrix, stats), nil
+}
+
+func (a *App) queryChartStats(ctx context.Context, chart config.ChartConfig, requestedAt time.Time) ([]charts.Stat, error) { // A
+	if len(chart.Stats) == 0 {
+		return nil, nil
+	}
+
+	stats := make([]charts.Stat, 0, len(chart.Stats))
+	for _, stat := range chart.Stats {
+		matrix, err := a.querier.QueryRange(ctx, prometheus.RangeQuery{
+			Query: stat.Query,
+			Start: requestedAt.Add(-stat.Lookback.Duration),
+			End:   requestedAt,
+			Step:  stat.Step.Duration,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("query chart stat %q: %w", stat.Name, err)
+		}
+
+		resolvedStat, err := charts.BuildStat(stat, matrix)
+		if err != nil {
+			return nil, fmt.Errorf("build chart stat %q: %w", stat.Name, err)
+		}
+		stats = append(stats, resolvedStat)
+	}
+
+	return stats, nil
+}
+
 func indexCharts(charts []config.ChartConfig) map[string]config.ChartConfig { // A
 	indexed := make(map[string]config.ChartConfig, len(charts))
 	for _, chart := range charts {
@@ -402,7 +442,14 @@ func (a *App) handleMixedChartRequest(w http.ResponseWriter, r *http.Request) { 
 			return
 		}
 
-		docs = append(docs, charts.BuildDocument(chart, requestedAt, matrix))
+		stats, statsErr := a.queryChartStats(r.Context(), chart, requestedAt)
+		if statsErr != nil {
+			a.logger.Error("query chart stats failed", "mixed_chart", mc.Name, "chart", chartName, "requested_at", requestedAt.Unix(), "err", statsErr)
+			http.Error(w, "failed to query chart data", http.StatusBadGateway)
+			return
+		}
+
+		docs = append(docs, charts.BuildDocumentWithStats(chart, requestedAt, matrix, stats))
 	}
 
 	switch format {

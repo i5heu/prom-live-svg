@@ -69,14 +69,26 @@ type LoggingConfig struct {
 }
 
 type ChartConfig struct {
+	Name      string            `json:"name" yaml:"name"`
+	Title     string            `json:"title" yaml:"title"`
+	Query     string            `json:"query" yaml:"query"`
+	QueryFile string            `json:"query_file" yaml:"query_file"`
+	Width     int               `json:"width" yaml:"width"`
+	Height    int               `json:"height" yaml:"height"`
+	Lookback  Duration          `json:"lookback" yaml:"lookback"`
+	Step      Duration          `json:"step" yaml:"step"`
+	Stats     []ChartStatConfig `json:"stats" yaml:"stats"`
+}
+
+type ChartStatConfig struct {
 	Name      string   `json:"name" yaml:"name"`
-	Title     string   `json:"title" yaml:"title"`
+	Label     string   `json:"label" yaml:"label"`
 	Query     string   `json:"query" yaml:"query"`
 	QueryFile string   `json:"query_file" yaml:"query_file"`
-	Width     int      `json:"width" yaml:"width"`
-	Height    int      `json:"height" yaml:"height"`
 	Lookback  Duration `json:"lookback" yaml:"lookback"`
 	Step      Duration `json:"step" yaml:"step"`
+	Decimals  int      `json:"decimals" yaml:"decimals"`
+	Unit      string   `json:"unit" yaml:"unit"`
 }
 
 type MixedChartConfig struct {
@@ -171,36 +183,50 @@ func resolveChartQueries(baseDir string, cfg *Config) error { // A
 
 	for i := range cfg.Charts {
 		chart := &cfg.Charts[i]
-		chart.Query = strings.TrimSpace(chart.Query)
-		chart.QueryFile = strings.TrimSpace(chart.QueryFile)
-
 		prefix := fmt.Sprintf("charts[%d]", i)
-		switch {
-		case chart.Query != "" && chart.QueryFile != "":
-			errs = append(errs, fmt.Errorf("%s must set only one of query or query_file", prefix))
-			continue
-		case chart.QueryFile == "":
-			continue
+
+		if err := resolveQuerySource(baseDir, prefix, &chart.Query, &chart.QueryFile); err != nil {
+			errs = append(errs, err)
 		}
 
-		resolvedPath := chart.QueryFile
-		if !filepath.IsAbs(resolvedPath) {
-			resolvedPath = filepath.Join(baseDir, resolvedPath)
+		for j := range chart.Stats {
+			stat := &chart.Stats[j]
+			statPrefix := fmt.Sprintf("%s.stats[%d]", prefix, j)
+			if err := resolveQuerySource(baseDir, statPrefix, &stat.Query, &stat.QueryFile); err != nil {
+				errs = append(errs, err)
+			}
 		}
-
-		data, err := os.ReadFile(resolvedPath)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("read %s.query_file %q: %w", prefix, chart.QueryFile, err))
-			continue
-		}
-
-		chart.Query = string(data)
 	}
 
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
 
+	return nil
+}
+
+func resolveQuerySource(baseDir string, prefix string, query *string, queryFile *string) error { // A
+	*query = strings.TrimSpace(*query)
+	*queryFile = strings.TrimSpace(*queryFile)
+
+	switch {
+	case *query != "" && *queryFile != "":
+		return fmt.Errorf("%s must set only one of query or query_file", prefix)
+	case *queryFile == "":
+		return nil
+	}
+
+	resolvedPath := *queryFile
+	if !filepath.IsAbs(resolvedPath) {
+		resolvedPath = filepath.Join(baseDir, resolvedPath)
+	}
+
+	data, err := os.ReadFile(resolvedPath)
+	if err != nil {
+		return fmt.Errorf("read %s.query_file %q: %w", prefix, *queryFile, err)
+	}
+
+	*query = string(data)
 	return nil
 }
 
@@ -287,6 +313,23 @@ func normalize(cfg *Config) { // A
 		}
 		if cfg.Charts[i].Step.Duration == 0 {
 			cfg.Charts[i].Step = defaults.Generation.Interval
+		}
+		for j := range cfg.Charts[i].Stats {
+			stat := &cfg.Charts[i].Stats[j]
+			stat.Name = strings.TrimSpace(stat.Name)
+			stat.Label = strings.TrimSpace(stat.Label)
+			stat.Query = strings.TrimSpace(stat.Query)
+			stat.QueryFile = strings.TrimSpace(stat.QueryFile)
+			stat.Unit = strings.TrimSpace(stat.Unit)
+			if stat.Label == "" {
+				stat.Label = stat.Name
+			}
+			if stat.Lookback.Duration == 0 {
+				stat.Lookback = cfg.Charts[i].Step
+			}
+			if stat.Step.Duration == 0 {
+				stat.Step = cfg.Charts[i].Step
+			}
 		}
 	}
 
@@ -397,6 +440,37 @@ func validate(cfg Config) error { // A
 		}
 		if chart.Step.Duration > chart.Lookback.Duration {
 			errs = append(errs, fmt.Errorf("%s.step must be less than or equal to %s.lookback", prefix, prefix))
+		}
+
+		seenStats := make(map[string]struct{}, len(chart.Stats))
+		for j, stat := range chart.Stats {
+			statPrefix := fmt.Sprintf("%s.stats[%d]", prefix, j)
+			if stat.Name == "" {
+				errs = append(errs, fmt.Errorf("%s.name must not be empty", statPrefix))
+			} else {
+				if !chartNamePattern.MatchString(stat.Name) {
+					errs = append(errs, fmt.Errorf("%s.name must match %s", statPrefix, chartNamePattern.String()))
+				}
+				if _, exists := seenStats[stat.Name]; exists {
+					errs = append(errs, fmt.Errorf("duplicate stat name %q in chart %q", stat.Name, chart.Name))
+				}
+				seenStats[stat.Name] = struct{}{}
+			}
+			if stat.Query == "" {
+				errs = append(errs, fmt.Errorf("%s must define a non-empty query or query_file", statPrefix))
+			}
+			if stat.Lookback.Duration <= 0 {
+				errs = append(errs, fmt.Errorf("%s.lookback must be greater than zero", statPrefix))
+			}
+			if stat.Step.Duration <= 0 {
+				errs = append(errs, fmt.Errorf("%s.step must be greater than zero", statPrefix))
+			}
+			if stat.Step.Duration > stat.Lookback.Duration {
+				errs = append(errs, fmt.Errorf("%s.step must be less than or equal to %s.lookback", statPrefix, statPrefix))
+			}
+			if stat.Decimals < 0 {
+				errs = append(errs, fmt.Errorf("%s.decimals must be greater than or equal to zero", statPrefix))
+			}
 		}
 	}
 

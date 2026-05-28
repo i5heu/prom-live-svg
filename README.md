@@ -41,6 +41,31 @@ charts:
 
 Use exactly one of `query` or `query_file` per chart.
 
+Charts can also define headline `stats` queries. Each stat runs its own Prometheus range query, takes the latest sample (summing across returned series), and renders that value prominently in the SVG while the main chart query stays as the background history graph.
+
+```yaml
+charts:
+  - name: chrony_requests_summary
+    title: Chrony requests
+    query_file: queries/chrony_packets_accepted.promql
+    lookback: 5m
+    step: 15s
+    stats:
+      - name: all_time_requests
+        label: All time requests
+        query_file: queries/chrony_packets_total.promql
+        lookback: 15s
+        step: 15s
+        decimals: 0
+      - name: requests_per_second
+        label: Req/s
+        query_file: queries/chrony_packets_accepted.promql
+        lookback: 15s
+        step: 15s
+        decimals: 2
+        unit: req/s
+```
+
 ### Chart HTTP endpoints
 
 The HTTP server now exposes chart endpoints in two formats:
@@ -97,10 +122,10 @@ The config loader supports these environment variables:
 - [x] test data and configurations
 - [x] http server basic setup
   - [x] http must hold a connection if it is a valid 1/4 of a minute until the svg or json is available, then it should serve the svg and json charts in said request, so we can handle browsers that have a fast running clock.
+- [x] SVG renderer with SVG template
 - [ ] caching setup for svg and json charts
   - [ ] Multi read and single write lock with fallback for the reads to the previous svg and json charts.
   - [ ] Must cache svg and json for 15 min
-- [ ] SVG renderer with SVG template
 - [ ] Provide prometheus exporter for the service itself so we can monitor requests, query time and draw times.
 
 

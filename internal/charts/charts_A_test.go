@@ -381,6 +381,93 @@ func TestRenderSVGIncludesCorrectDimensions(t *testing.T) { // A
 	}
 }
 
+func TestBuildStatUsesLatestAggregateValue(t *testing.T) { // A
+	t.Parallel()
+
+	stat, err := BuildStat(config.ChartStatConfig{
+		Name:     "requests_per_second",
+		Label:    "Req/s",
+		Decimals: 2,
+		Unit:     "req/s",
+	}, prometheus.Matrix{
+		Series: []prometheus.Series{
+			{
+				Values: []prometheus.Sample{
+					{Timestamp: time.Unix(1779896340, 0).UTC(), Value: 120.125},
+					{Timestamp: time.Unix(1779896355, 0).UTC(), Value: 140.5},
+				},
+			},
+			{
+				Values: []prometheus.Sample{
+					{Timestamp: time.Unix(1779896355, 0).UTC(), Value: 2.25},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildStat returned error: %v", err)
+	}
+
+	if got, want := stat.Value, 142.75; got != want {
+		t.Fatalf("unexpected stat value: got %v want %v", got, want)
+	}
+	if got, want := stat.Formatted, "142.75 req/s"; got != want {
+		t.Fatalf("unexpected formatted stat value: got %q want %q", got, want)
+	}
+}
+
+func TestRenderSVGIncludesStatsOverlay(t *testing.T) { // A
+	t.Parallel()
+
+	document := Document{
+		Kind:        "prometheus_matrix_chart",
+		Chart:       "summary",
+		Title:       "Chrony requests",
+		RequestedAt: 1779896355,
+		StartAt:     1779896055,
+		EndAt:       1779896355,
+		StepSeconds: 15,
+		Width:       800,
+		Height:      320,
+		Series: []Series{
+			{
+				Metric: map[string]string{"instance": "chrony.example:9123"},
+				Values: []Point{
+					{Timestamp: 1779896055, Value: 300},
+					{Timestamp: 1779896205, Value: 320},
+					{Timestamp: 1779896355, Value: 340.51},
+				},
+			},
+		},
+		Stats: []Stat{
+			{Name: "all_time_requests", Label: "All time requests", Value: 145678, Formatted: "145678"},
+			{Name: "requests_per_second", Label: "Req/s", Value: 340.51, Formatted: "340.51 req/s"},
+		},
+	}
+
+	svg, err := RenderSVG(document)
+	if err != nil {
+		t.Fatalf("RenderSVG returned error: %v", err)
+	}
+
+	body := string(svg)
+	if !strings.Contains(body, "All time requests") {
+		t.Fatal("expected SVG to contain the total requests stat label")
+	}
+	if !strings.Contains(body, "145678") {
+		t.Fatal("expected SVG to contain the total requests stat value")
+	}
+	if !strings.Contains(body, "340.51 req/s") {
+		t.Fatal("expected SVG to contain the requests per second stat value")
+	}
+	if !strings.Contains(body, "stroke-opacity=\"0.180\"") {
+		t.Fatal("expected stat overlay SVG to render the graph as a background line")
+	}
+	if !strings.Contains(body, "<line x1=\"48.000\"") {
+		t.Fatal("expected SVG to keep rendering chart axes when stats are overlaid")
+	}
+}
+
 func TestBuildSVGDataProducesCorrectStructure(t *testing.T) { // A
 	t.Parallel()
 
