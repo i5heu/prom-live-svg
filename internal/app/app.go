@@ -29,6 +29,7 @@ type App struct {
 	logger            *slog.Logger
 	server            *http.Server
 	querier           chartQuerier
+	requestStats      *requestStatStore
 	chartsByName      map[string]config.ChartConfig
 	mixedChartsByName map[string]config.MixedChartConfig
 	now               func() time.Time
@@ -55,7 +56,16 @@ func New(cfg config.Config) (*App, error) { // A
 		return nil, fmt.Errorf("create Prometheus client: %w", err)
 	}
 
-	return newApp(cfg, logger, querier), nil
+	application := newApp(cfg, logger, querier)
+	if hasPersistentStats(cfg) {
+		store, err := newRequestStatStore(cfg.Storage.DataDir)
+		if err != nil {
+			return nil, fmt.Errorf("create request stat store: %w", err)
+		}
+		application.requestStats = store
+	}
+
+	return application, nil
 }
 
 func newApp(cfg config.Config, logger *slog.Logger, querier chartQuerier) *App { // A
@@ -363,24 +373,139 @@ func (a *App) queryChartStats(ctx context.Context, chart config.ChartConfig, req
 
 	stats := make([]charts.Stat, 0, len(chart.Stats))
 	for _, stat := range chart.Stats {
-		matrix, err := a.querier.QueryRange(ctx, prometheus.RangeQuery{
-			Query: stat.Query,
-			Start: requestedAt.Add(-stat.Lookback.Duration),
-			End:   requestedAt,
-			Step:  stat.Step.Duration,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("query chart stat %q: %w", stat.Name, err)
-		}
+		var (
+			resolvedStat charts.Stat
+			err          error
+		)
 
-		resolvedStat, err := charts.BuildStat(stat, matrix)
+		if stat.Persist {
+			resolvedStat, err = a.buildPersistentChartStat(ctx, chart, stat, requestedAt)
+		} else {
+			matrix, qErr := a.querier.QueryRange(ctx, prometheus.RangeQuery{
+				Query: stat.Query,
+				Start: requestedAt.Add(-stat.Lookback.Duration),
+				End:   requestedAt,
+				Step:  stat.Step.Duration,
+			})
+			if qErr != nil {
+				return nil, fmt.Errorf("query chart stat %q: %w", stat.Name, qErr)
+			}
+			resolvedStat, err = charts.BuildStat(stat, matrix)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("build chart stat %q: %w", stat.Name, err)
 		}
+
 		stats = append(stats, resolvedStat)
 	}
 
 	return stats, nil
+}
+
+func (a *App) buildPersistentChartStat(ctx context.Context, chart config.ChartConfig, stat config.ChartStatConfig, requestedAt time.Time) (charts.Stat, error) { // A
+	if a.requestStats == nil {
+		return charts.Stat{}, fmt.Errorf("persistent stat store is not configured")
+	}
+
+	step := stat.Step.Duration
+	if step <= 0 {
+		step = chart.Step.Duration
+	}
+	if step <= 0 {
+		return charts.Stat{}, fmt.Errorf("persistent stat step must be greater than zero")
+	}
+
+	entry, hasEntry := a.requestStats.GetEntry(chart.Name, stat.Name)
+	if !hasEntry {
+		currentMatrix, err := a.querier.QueryRange(ctx, prometheus.RangeQuery{
+			Query: stat.Query,
+			Start: requestedAt.Add(-step),
+			End:   requestedAt,
+			Step:  step,
+		})
+		if err != nil {
+			return charts.Stat{}, fmt.Errorf("query chart stat %q: %w", stat.Name, err)
+		}
+
+		currentValue, ok := latestAggregateMatrixValue(currentMatrix)
+		if !ok {
+			return charts.Stat{}, fmt.Errorf("stat query returned no samples")
+		}
+
+		initialTotal := currentValue
+		if stat.SeedQuery != "" {
+			seedMatrix, err := a.querier.QueryRange(ctx, prometheus.RangeQuery{
+				Query: stat.SeedQuery,
+				Start: requestedAt.Add(-step),
+				End:   requestedAt,
+				Step:  step,
+			})
+			if err != nil {
+				return charts.Stat{}, fmt.Errorf("query chart stat seed %q: %w", stat.Name, err)
+			}
+
+			seedValue, ok := latestAggregateMatrixValue(seedMatrix)
+			if !ok {
+				return charts.Stat{}, fmt.Errorf("stat seed query returned no samples")
+			}
+			initialTotal = seedValue
+		}
+
+		entry, err = a.requestStats.InitializeEntry(chart.Name, stat.Name, initialTotal, currentValue, requestedAt)
+		if err != nil {
+			return charts.Stat{}, err
+		}
+		return charts.BuildStatFromValue(stat, entry.Total), nil
+	}
+
+	if entry.LastObservedAt <= 0 {
+		currentMatrix, err := a.querier.QueryRange(ctx, prometheus.RangeQuery{
+			Query: stat.Query,
+			Start: requestedAt.Add(-step),
+			End:   requestedAt,
+			Step:  step,
+		})
+		if err != nil {
+			return charts.Stat{}, fmt.Errorf("query chart stat %q: %w", stat.Name, err)
+		}
+
+		currentValue, ok := latestAggregateMatrixValue(currentMatrix)
+		if !ok {
+			return charts.BuildStatFromValue(stat, entry.Total), nil
+		}
+
+		entry, err = a.requestStats.InitializeEntry(chart.Name, stat.Name, entry.Total, currentValue, requestedAt)
+		if err != nil {
+			return charts.Stat{}, err
+		}
+		return charts.BuildStatFromValue(stat, entry.Total), nil
+	}
+
+	if requestedAt.UTC().Unix() <= entry.LastObservedAt {
+		return charts.BuildStatFromValue(stat, entry.Total), nil
+	}
+
+	deltaMatrix, err := a.querier.QueryRange(ctx, prometheus.RangeQuery{
+		Query: stat.Query,
+		Start: time.Unix(entry.LastObservedAt, 0).UTC(),
+		End:   requestedAt,
+		Step:  step,
+	})
+	if err != nil {
+		return charts.Stat{}, fmt.Errorf("query chart stat %q delta: %w", stat.Name, err)
+	}
+
+	delta, lastObserved, ok := counterDeltaFromMatrix(deltaMatrix)
+	if !ok {
+		return charts.BuildStatFromValue(stat, entry.Total), nil
+	}
+
+	updatedEntry, err := a.requestStats.AddDelta(chart.Name, stat.Name, delta, lastObserved, requestedAt)
+	if err != nil {
+		return charts.Stat{}, err
+	}
+
+	return charts.BuildStatFromValue(stat, updatedEntry.Total), nil
 }
 
 func indexCharts(charts []config.ChartConfig) map[string]config.ChartConfig { // A

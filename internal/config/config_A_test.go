@@ -165,6 +165,11 @@ func TestLoadReadsChartStatQueryFilesRelativeToConfig(t *testing.T) { // A
 		t.Fatalf("write stat query file: %v", err)
 	}
 
+	seedQueryPath := filepath.Join(queriesDir, "seed.promql")
+	if err := os.WriteFile(seedQueryPath, []byte("increase(up[365d])\n"), 0o644); err != nil {
+		t.Fatalf("write seed query file: %v", err)
+	}
+
 	configPath := filepath.Join(tempDir, "config.yaml")
 	configBody := `prometheus:
   base_url: https://prometheus.example.com
@@ -175,6 +180,8 @@ charts:
     stats:
       - name: total_requests
         query_file: queries/total.promql
+        seed_query_file: queries/seed.promql
+        persist: true
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -194,11 +201,17 @@ charts:
 	if got, want := cfg.Charts[0].Stats[0].Label, "total_requests"; got != want {
 		t.Fatalf("unexpected default stat label: got %q want %q", got, want)
 	}
+	if got, want := cfg.Charts[0].Stats[0].SeedQuery, "increase(up[365d])"; got != want {
+		t.Fatalf("unexpected stat seed query: got %q want %q", got, want)
+	}
 	if got, want := cfg.Charts[0].Stats[0].Lookback.Duration, 15*time.Second; got != want {
 		t.Fatalf("unexpected default stat lookback: got %s want %s", got, want)
 	}
 	if got, want := cfg.Charts[0].Stats[0].Step.Duration, 15*time.Second; got != want {
 		t.Fatalf("unexpected default stat step: got %s want %s", got, want)
+	}
+	if !cfg.Charts[0].Stats[0].Persist {
+		t.Fatal("expected stat persist flag to be loaded from config")
 	}
 }
 

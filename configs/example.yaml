@@ -39,9 +39,11 @@ charts:
           - name: all_time_requests
             label: All time requests
             query_file: queries/chrony_packets_total.promql
+            seed_query_file: queries/chrony_packets_total_1y.promql
             lookback: 15s
             step: 15s
             decimals: 0
+            persist: true
           - name: requests_per_second
             label: Req/s
             query_file: queries/chrony_packets_accepted.promql

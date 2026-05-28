@@ -43,6 +43,12 @@ Use exactly one of `query` or `query_file` per chart.
 
 Charts can also define headline `stats` queries. Each stat runs its own Prometheus range query, takes the latest sample (summing across returned series), and renders that value prominently in the SVG while the main chart query stays as the background history graph.
 
+If a stat should survive Prometheus/exporter counter resets and app restarts, set `persist: true`. In that mode `prom-live-svg` stores the last observed raw counter and accumulated total in `storage.data_dir/request_stats.json`.
+
+You can also provide `seed_query` / `seed_query_file` to initialize the persistent total from a large historical Prometheus query (for example `increase(...[365d])`). After that, `prom-live-svg` stores the last observed timestamp and only queries Prometheus for the smaller follow-up window from that timestamp to the current request time.
+
+`persist: true` is meant for raw monotonic counter totals like `requests_total`, not rate queries like `rate(...[5m])`. The optional `seed_query` is where a long-range `increase(...[365d])` belongs.
+
 ```yaml
 charts:
   - name: chrony_requests_summary
@@ -54,9 +60,11 @@ charts:
       - name: all_time_requests
         label: All time requests
         query_file: queries/chrony_packets_total.promql
+        seed_query_file: queries/chrony_packets_total_1y.promql
         lookback: 15s
         step: 15s
         decimals: 0
+        persist: true
       - name: requests_per_second
         label: Req/s
         query_file: queries/chrony_packets_accepted.promql

@@ -99,12 +99,16 @@ func BuildStat(cfg config.ChartStatConfig, matrix prometheus.Matrix) (Stat, erro
 		return Stat{}, fmt.Errorf("stat query returned no samples")
 	}
 
+	return BuildStatFromValue(cfg, value), nil
+}
+
+func BuildStatFromValue(cfg config.ChartStatConfig, value float64) Stat { // A
 	return Stat{
 		Name:      cfg.Name,
 		Label:     cfg.Label,
 		Value:     value,
 		Formatted: formatStatValue(value, cfg.Decimals, cfg.Unit),
-	}, nil
+	}
 }
 
 func MarshalJSON(doc Document) ([]byte, error) { // A

@@ -32,6 +32,7 @@ type fixtureEntry struct {
 
 type fixtureQuerier struct {
 	matricesByQuery map[string]promapi.Matrix
+	queries         []promapi.RangeQuery
 	callCount       int
 }
 
@@ -40,7 +41,7 @@ func TestHandleChartJSONUsesFixtureData(t *testing.T) { // A
 
 	cfg := loadFixtureConfig(t)
 	querier := newFixtureQuerier(t, fixtureDatasetPath())
-	application := newTestApp(cfg, querier)
+	application := newTestApp(t, cfg, querier)
 
 	request := httptest.NewRequest(http.MethodGet, "/charts/chrony_packets_accepted/1779896355.json", nil)
 	response := httptest.NewRecorder()
@@ -84,7 +85,7 @@ func TestHandleChartSVGUsesFixtureData(t *testing.T) { // A
 
 	cfg := loadFixtureConfig(t)
 	querier := newFixtureQuerier(t, fixtureDatasetPath())
-	application := newTestApp(cfg, querier)
+	application := newTestApp(t, cfg, querier)
 
 	request := httptest.NewRequest(http.MethodGet, "/charts/chrony_source_offset_by_source/1779896355.svg", nil)
 	response := httptest.NewRecorder()
@@ -112,7 +113,7 @@ func TestHandleChartJSONWithoutTimestampUsesCurrentAlignedWindow(t *testing.T) {
 
 	cfg := loadFixtureConfig(t)
 	querier := newFixtureQuerier(t, fixtureDatasetPath())
-	application := newTestApp(cfg, querier)
+	application := newTestApp(t, cfg, querier)
 	application.now = func() time.Time { return time.Unix(1779896361, 0).UTC() }
 
 	waitCalled := false
@@ -147,7 +148,7 @@ func TestHandleChartWaitsForNextAlignedTimestamp(t *testing.T) { // A
 
 	cfg := loadFixtureConfig(t)
 	querier := newFixtureQuerier(t, fixtureDatasetPath())
-	application := newTestApp(cfg, querier)
+	application := newTestApp(t, cfg, querier)
 
 	now := time.Unix(1779896342, 0).UTC()
 	application.now = func() time.Time { return now }
@@ -179,7 +180,7 @@ func TestHandleChartRejectsTimestampTooFarInFuture(t *testing.T) { // A
 
 	cfg := loadFixtureConfig(t)
 	querier := newFixtureQuerier(t, fixtureDatasetPath())
-	application := newTestApp(cfg, querier)
+	application := newTestApp(t, cfg, querier)
 	application.now = func() time.Time { return time.Unix(1779896330, 0).UTC() }
 	application.waitUntil = application.waitForRequestedTimestamp
 
@@ -201,7 +202,7 @@ func TestHandleChartRejectsUnalignedTimestamp(t *testing.T) { // A
 
 	cfg := loadFixtureConfig(t)
 	querier := newFixtureQuerier(t, fixtureDatasetPath())
-	application := newTestApp(cfg, querier)
+	application := newTestApp(t, cfg, querier)
 
 	request := httptest.NewRequest(http.MethodGet, "/charts/chrony_packets_accepted/1779896354.json", nil)
 	response := httptest.NewRecorder()
@@ -231,12 +232,14 @@ func TestHandleChartJSONIncludesStats(t *testing.T) { // A
 			Step:     config.Duration{Duration: 15 * time.Second},
 			Stats: []config.ChartStatConfig{
 				{
-					Name:     "all_time_requests",
-					Label:    "All time requests",
-					Query:    "chrony_serverstats_ntp_packets_received_total - chrony_serverstats_ntp_packets_dropped_total",
-					Lookback: config.Duration{Duration: 15 * time.Second},
-					Step:     config.Duration{Duration: 15 * time.Second},
-					Decimals: 0,
+					Name:      "all_time_requests",
+					Label:     "All time requests",
+					Query:     "chrony_serverstats_ntp_packets_received_total - chrony_serverstats_ntp_packets_dropped_total",
+					SeedQuery: "increase(chrony_serverstats_ntp_packets_received_total[365d]) - increase(chrony_serverstats_ntp_packets_dropped_total[365d])",
+					Lookback:  config.Duration{Duration: 15 * time.Second},
+					Step:      config.Duration{Duration: 15 * time.Second},
+					Decimals:  0,
+					Persist:   true,
 				},
 				{
 					Name:     "requests_per_second",
@@ -253,6 +256,7 @@ func TestHandleChartJSONIncludesStats(t *testing.T) { // A
 
 	backgroundQuery := cfg.Charts[0].Query
 	totalQuery := cfg.Charts[0].Stats[0].Query
+	seedQuery := cfg.Charts[0].Stats[0].SeedQuery
 	querier := &fixtureQuerier{
 		matricesByQuery: map[string]promapi.Matrix{
 			backgroundQuery: {
@@ -278,9 +282,20 @@ func TestHandleChartJSONIncludesStats(t *testing.T) { // A
 					},
 				},
 			},
+			seedQuery: {
+				Series: []promapi.Series{
+					{
+						Metric: map[string]string{"instance": "chrony.example:9123"},
+						Values: []promapi.Sample{
+							{Timestamp: time.Unix(1779896340, 0).UTC(), Value: 140000},
+							{Timestamp: time.Unix(1779896355, 0).UTC(), Value: 140000},
+						},
+					},
+				},
+			},
 		},
 	}
-	application := newTestApp(cfg, querier)
+	application := newTestApp(t, cfg, querier)
 
 	request := httptest.NewRequest(http.MethodGet, "/charts/chrony_requests_summary/1779896355.json", nil)
 	response := httptest.NewRecorder()
@@ -299,14 +314,55 @@ func TestHandleChartJSONIncludesStats(t *testing.T) { // A
 	if got, want := len(document.Stats), 2; got != want {
 		t.Fatalf("unexpected stat count: got %d want %d", got, want)
 	}
-	if got, want := document.Stats[0].Formatted, "145678"; got != want {
-		t.Fatalf("unexpected formatted total stat: got %q want %q", got, want)
+	if got, want := document.Stats[0].Formatted, "140000"; got != want {
+		t.Fatalf("unexpected formatted total stat on first seeded response: got %q want %q", got, want)
 	}
 	if got, want := document.Stats[1].Formatted, "340.51 req/s"; got != want {
 		t.Fatalf("unexpected formatted rate stat: got %q want %q", got, want)
 	}
-	if got, want := querier.callCount, 3; got != want {
-		t.Fatalf("unexpected querier call count: got %d want %d", got, want)
+	if got, want := querier.callCount, 4; got != want {
+		t.Fatalf("unexpected querier call count after first response: got %d want %d", got, want)
+	}
+
+	querier.matricesByQuery[totalQuery] = promapi.Matrix{Series: []promapi.Series{{
+		Metric: map[string]string{"instance": "chrony.example:9123"},
+		Values: []promapi.Sample{
+			{Timestamp: time.Unix(1779896355, 0).UTC(), Value: 145678},
+			{Timestamp: time.Unix(1779896370, 0).UTC(), Value: 145686},
+		},
+	}}}
+	querier.matricesByQuery[backgroundQuery] = promapi.Matrix{Series: []promapi.Series{{
+		Metric: map[string]string{"instance": "chrony.example:9123"},
+		Values: []promapi.Sample{
+			{Timestamp: time.Unix(1779896070, 0).UTC(), Value: 320.1},
+			{Timestamp: time.Unix(1779896220, 0).UTC(), Value: 336.2},
+			{Timestamp: time.Unix(1779896370, 0).UTC(), Value: 341.75},
+		},
+	}}}
+
+	secondRequest := httptest.NewRequest(http.MethodGet, "/charts/chrony_requests_summary/1779896370.json", nil)
+	secondResponse := httptest.NewRecorder()
+	application.server.Handler.ServeHTTP(secondResponse, secondRequest)
+
+	if got, want := secondResponse.Code, http.StatusOK; got != want {
+		t.Fatalf("unexpected second status: got %d want %d", got, want)
+	}
+
+	var secondDocument charts.Document
+	if err := json.Unmarshal(secondResponse.Body.Bytes(), &secondDocument); err != nil {
+		t.Fatalf("decode second response JSON: %v", err)
+	}
+	if got, want := secondDocument.Stats[0].Formatted, "140008"; got != want {
+		t.Fatalf("unexpected formatted total stat on second response: got %q want %q", got, want)
+	}
+	if got, want := querier.callCount, 7; got != want {
+		t.Fatalf("unexpected querier call count after second response: got %d want %d", got, want)
+	}
+	if got, want := querier.queries[5].Start.Unix(), int64(1779896355); got != want {
+		t.Fatalf("unexpected persistent delta query start: got %d want %d", got, want)
+	}
+	if got, want := querier.queries[5].End.Unix(), int64(1779896370); got != want {
+		t.Fatalf("unexpected persistent delta query end: got %d want %d", got, want)
 	}
 }
 
@@ -315,7 +371,7 @@ func TestHandleChartReturnsNotFoundForUnknownChart(t *testing.T) { // A
 
 	cfg := loadFixtureConfig(t)
 	querier := newFixtureQuerier(t, fixtureDatasetPath())
-	application := newTestApp(cfg, querier)
+	application := newTestApp(t, cfg, querier)
 
 	request := httptest.NewRequest(http.MethodGet, "/charts/unknown/1779896355.json", nil)
 	response := httptest.NewRecorder()
@@ -346,9 +402,19 @@ func repositoryRootFromPackage() string { // A
 	return filepath.Join("..", "..")
 }
 
-func newTestApp(cfg config.Config, querier *fixtureQuerier) *App { // A
+func newTestApp(t *testing.T, cfg config.Config, querier *fixtureQuerier) *App { // A
+	t.Helper()
+
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application := newApp(cfg, logger, querier)
+	if hasPersistentStats(cfg) {
+		cfg.Storage.DataDir = t.TempDir()
+		store, err := newRequestStatStore(cfg.Storage.DataDir)
+		if err != nil {
+			t.Fatalf("create request stat store: %v", err)
+		}
+		application.requestStats = store
+	}
 	application.now = func() time.Time { return time.Unix(1779896355, 0).UTC() }
 	application.waitUntil = func(_ context.Context, _ time.Time) error { return nil }
 	return application
@@ -408,6 +474,7 @@ func (f *fixtureQuerier) QueryChartRange(_ context.Context, chart config.ChartCo
 
 func (f *fixtureQuerier) QueryRange(_ context.Context, query promapi.RangeQuery) (promapi.Matrix, error) { // A
 	f.callCount++
+	f.queries = append(f.queries, query)
 
 	matrix, ok := f.matricesByQuery[strings.TrimSpace(query.Query)]
 	if !ok {

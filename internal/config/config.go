@@ -81,14 +81,17 @@ type ChartConfig struct {
 }
 
 type ChartStatConfig struct {
-	Name      string   `json:"name" yaml:"name"`
-	Label     string   `json:"label" yaml:"label"`
-	Query     string   `json:"query" yaml:"query"`
-	QueryFile string   `json:"query_file" yaml:"query_file"`
-	Lookback  Duration `json:"lookback" yaml:"lookback"`
-	Step      Duration `json:"step" yaml:"step"`
-	Decimals  int      `json:"decimals" yaml:"decimals"`
-	Unit      string   `json:"unit" yaml:"unit"`
+	Name          string   `json:"name" yaml:"name"`
+	Label         string   `json:"label" yaml:"label"`
+	Query         string   `json:"query" yaml:"query"`
+	QueryFile     string   `json:"query_file" yaml:"query_file"`
+	SeedQuery     string   `json:"seed_query" yaml:"seed_query"`
+	SeedQueryFile string   `json:"seed_query_file" yaml:"seed_query_file"`
+	Lookback      Duration `json:"lookback" yaml:"lookback"`
+	Step          Duration `json:"step" yaml:"step"`
+	Decimals      int      `json:"decimals" yaml:"decimals"`
+	Unit          string   `json:"unit" yaml:"unit"`
+	Persist       bool     `json:"persist" yaml:"persist"`
 }
 
 type MixedChartConfig struct {
@@ -193,6 +196,9 @@ func resolveChartQueries(baseDir string, cfg *Config) error { // A
 			stat := &chart.Stats[j]
 			statPrefix := fmt.Sprintf("%s.stats[%d]", prefix, j)
 			if err := resolveQuerySource(baseDir, statPrefix, &stat.Query, &stat.QueryFile); err != nil {
+				errs = append(errs, err)
+			}
+			if err := resolveQuerySource(baseDir, statPrefix+".seed", &stat.SeedQuery, &stat.SeedQueryFile); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -320,6 +326,8 @@ func normalize(cfg *Config) { // A
 			stat.Label = strings.TrimSpace(stat.Label)
 			stat.Query = strings.TrimSpace(stat.Query)
 			stat.QueryFile = strings.TrimSpace(stat.QueryFile)
+			stat.SeedQuery = strings.TrimSpace(stat.SeedQuery)
+			stat.SeedQueryFile = strings.TrimSpace(stat.SeedQueryFile)
 			stat.Unit = strings.TrimSpace(stat.Unit)
 			if stat.Label == "" {
 				stat.Label = stat.Name
@@ -458,6 +466,9 @@ func validate(cfg Config) error { // A
 			}
 			if stat.Query == "" {
 				errs = append(errs, fmt.Errorf("%s must define a non-empty query or query_file", statPrefix))
+			}
+			if !stat.Persist && stat.SeedQuery != "" {
+				errs = append(errs, fmt.Errorf("%s.seed requires persist: true", statPrefix))
 			}
 			if stat.Lookback.Duration <= 0 {
 				errs = append(errs, fmt.Errorf("%s.lookback must be greater than zero", statPrefix))
