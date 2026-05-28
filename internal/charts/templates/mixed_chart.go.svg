@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="{{.Width}}" height="{{.Height}}" viewBox="0 0 {{.Width}} {{.Height}}" role="img" aria-label="{{.Title | escape}}">
+<rect width="100%" height="100%" fill="#ffffff"/>
+{{- $leftPad := .LeftPad }}
+{{- $topPad := .TopPad }}
+{{- $rightPad := .RightPad }}
+{{- $bottomPad := .BottomPad }}
+{{- $plotWidth := .PlotWidth }}
+{{- $gap := .Gap }}
+{{- range $i, $chartFrame := .Charts }}
+<g transform="translate(0, {{index $.ChartOffsets $i}})">
+<rect x="{{$leftPad}}" y="{{$topPad}}" width="{{$plotWidth}}" height="{{$chartFrame.ChartHeight}}" fill="none" stroke="#e5e7eb" stroke-width="1"/>
+<text x="{{$leftPad}}" y="20" font-family="sans-serif" font-size="14" fill="#111827"><tspan font-weight="bold">{{$chartFrame.Title | escape}} </tspan><tspan font-size="11" fill="#6b7280">{{$chartFrame.MaxLabel}} – {{$chartFrame.MinLabel}}</tspan></text>
+<line x1="{{$leftPad}}" y1="{{$topPad}}" x2="{{$leftPad}}" y2="{{$chartFrame.AxisBottom}}" stroke="#d1d5db" stroke-width="1"/>
+<line x1="{{$leftPad}}" y1="{{$chartFrame.AxisBottom}}" x2="{{$chartFrame.AxisRight}}" y2="{{$chartFrame.AxisBottom}}" stroke="#d1d5db" stroke-width="1"/>
+<text x="8" y="{{$chartFrame.TopPadLabelY}}" font-family="sans-serif" font-size="11" fill="#6b7280">{{$chartFrame.MaxLabel}}</text>
+<text x="8" y="{{$chartFrame.BottomPadLabelY}}" font-family="sans-serif" font-size="11" fill="#6b7280">{{$chartFrame.MinLabel}}</text>
+<text x="{{$leftPad}}" y="{{$chartFrame.XLabelY}}" font-family="sans-serif" font-size="11" fill="#6b7280">{{$chartFrame.StartAt}}</text>
+<text x="{{$chartFrame.AxisRight}}" y="{{$chartFrame.XLabelY}}" text-anchor="end" font-family="sans-serif" font-size="11" fill="#6b7280">{{$chartFrame.EndAt}}</text>
+{{- if $chartFrame.HasData }}
+{{- range $chartFrame.Series }}
+<polyline fill="none" stroke="{{.Color}}" stroke-width="2" points="{{.Points}}"/>
+{{- end }}
+{{- else }}
+<text x="{{$chartFrame.CenterX}}" y="{{$chartFrame.CenterY}}" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#6b7280">no data</text>
+{{- end }}
+</g>
+{{- end }}
+</svg>

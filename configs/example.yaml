@@ -46,3 +46,12 @@ charts:
       step: 15s
       width: 800
       height: 320
+
+mixed_charts:
+    - name: chrony_overview
+      title: Chrony Overview
+      charts:
+          - chrony_packets_accepted_inline
+          - chrony_packets_accepted_file
+      width: 800
+      height: 640

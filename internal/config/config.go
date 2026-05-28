@@ -21,14 +21,15 @@ type Duration struct {
 }
 
 type Config struct {
-	Service    ServiceConfig    `json:"service" yaml:"service"`
-	HTTP       HTTPConfig       `json:"http" yaml:"http"`
-	Prometheus PrometheusConfig `json:"prometheus" yaml:"prometheus"`
-	Generation GenerationConfig `json:"generation" yaml:"generation"`
-	Cache      CacheConfig      `json:"cache" yaml:"cache"`
-	Storage    StorageConfig    `json:"storage" yaml:"storage"`
-	Logging    LoggingConfig    `json:"logging" yaml:"logging"`
-	Charts     []ChartConfig    `json:"charts" yaml:"charts"`
+	Service     ServiceConfig      `json:"service" yaml:"service"`
+	HTTP        HTTPConfig         `json:"http" yaml:"http"`
+	Prometheus  PrometheusConfig   `json:"prometheus" yaml:"prometheus"`
+	Generation  GenerationConfig   `json:"generation" yaml:"generation"`
+	Cache       CacheConfig        `json:"cache" yaml:"cache"`
+	Storage     StorageConfig      `json:"storage" yaml:"storage"`
+	Logging     LoggingConfig      `json:"logging" yaml:"logging"`
+	Charts      []ChartConfig      `json:"charts" yaml:"charts"`
+	MixedCharts []MixedChartConfig `json:"mixed_charts" yaml:"mixed_charts"`
 }
 
 type ServiceConfig struct {
@@ -76,6 +77,14 @@ type ChartConfig struct {
 	Height    int      `json:"height" yaml:"height"`
 	Lookback  Duration `json:"lookback" yaml:"lookback"`
 	Step      Duration `json:"step" yaml:"step"`
+}
+
+type MixedChartConfig struct {
+	Name   string   `json:"name" yaml:"name"`
+	Title  string   `json:"title" yaml:"title"`
+	Charts []string `json:"charts" yaml:"charts"`
+	Width  int      `json:"width" yaml:"width"`
+	Height int      `json:"height" yaml:"height"`
 }
 
 func Default() Config { // H
@@ -280,6 +289,20 @@ func normalize(cfg *Config) { // A
 			cfg.Charts[i].Step = defaults.Generation.Interval
 		}
 	}
+
+	for i := range cfg.MixedCharts {
+		cfg.MixedCharts[i].Name = strings.TrimSpace(cfg.MixedCharts[i].Name)
+		cfg.MixedCharts[i].Title = strings.TrimSpace(cfg.MixedCharts[i].Title)
+		if cfg.MixedCharts[i].Title == "" {
+			cfg.MixedCharts[i].Title = cfg.MixedCharts[i].Name
+		}
+		if cfg.MixedCharts[i].Width == 0 {
+			cfg.MixedCharts[i].Width = 800
+		}
+		if cfg.MixedCharts[i].Height == 0 {
+			cfg.MixedCharts[i].Height = 640
+		}
+	}
 }
 
 func validate(cfg Config) error { // A
@@ -374,6 +397,36 @@ func validate(cfg Config) error { // A
 		}
 		if chart.Step.Duration > chart.Lookback.Duration {
 			errs = append(errs, fmt.Errorf("%s.step must be less than or equal to %s.lookback", prefix, prefix))
+		}
+	}
+
+	for i, mc := range cfg.MixedCharts {
+		prefix := fmt.Sprintf("mixed_charts[%d]", i)
+		if mc.Name == "" {
+			errs = append(errs, fmt.Errorf("%s.name must not be empty", prefix))
+		} else {
+			if !chartNamePattern.MatchString(mc.Name) {
+				errs = append(errs, fmt.Errorf("%s.name must match %s", prefix, chartNamePattern.String()))
+			}
+			if _, exists := seenCharts[mc.Name]; exists {
+				errs = append(errs, fmt.Errorf("duplicate name %q (mixed chart and chart names must be unique)", mc.Name))
+			}
+			seenCharts[mc.Name] = struct{}{}
+		}
+		if len(mc.Charts) == 0 {
+			errs = append(errs, fmt.Errorf("%s.charts must contain at least one chart name", prefix))
+		}
+		for j, chartName := range mc.Charts {
+			chartName = strings.TrimSpace(chartName)
+			if chartName == "" {
+				errs = append(errs, fmt.Errorf("%s.charts[%d] must not be empty", prefix, j))
+			}
+		}
+		if mc.Width <= 0 {
+			errs = append(errs, fmt.Errorf("%s.width must be greater than zero", prefix))
+		}
+		if mc.Height <= 0 {
+			errs = append(errs, fmt.Errorf("%s.height must be greater than zero", prefix))
 		}
 	}
 

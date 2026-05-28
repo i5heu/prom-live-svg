@@ -1,10 +1,8 @@
 package charts
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"html"
 	"math"
 	"strconv"
 	"time"
@@ -85,6 +83,7 @@ func MarshalJSON(doc Document) ([]byte, error) { // A
 	return json.Marshal(doc)
 }
 
+// RenderSVG renders a chart Document as an SVG string using a pre-compiled template.
 func RenderSVG(doc Document) ([]byte, error) { // A
 	if doc.Width <= 0 || doc.Height <= 0 {
 		return nil, fmt.Errorf("invalid SVG size %dx%d", doc.Width, doc.Height)
@@ -103,58 +102,21 @@ func RenderSVG(doc Document) ([]byte, error) { // A
 		return nil, fmt.Errorf("invalid plot area for SVG size %dx%d", doc.Width, doc.Height)
 	}
 
-	minValue, maxValue, hasData := valueBounds(doc)
-	if !hasData {
-		minValue = 0
-		maxValue = 1
-	}
-	if minValue == maxValue {
-		minValue -= 1
-		maxValue += 1
-	}
+	data := buildSVGData(doc)
+	return executeSVGTemplate(data)
+}
 
-	start := float64(doc.StartAt)
-	end := float64(doc.EndAt)
-	if start == end {
-		end = start + 1
+// RenderMixedSVG renders multiple chart Documents stacked vertically in a single SVG.
+func RenderMixedSVG(title string, width, height int, docs []Document) ([]byte, error) { // A
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("invalid SVG size %dx%d", width, height)
+	}
+	if len(docs) == 0 {
+		return nil, fmt.Errorf("at least one chart document is required for mixed chart")
 	}
 
-	var buffer bytes.Buffer
-	buffer.WriteString(fmt.Sprintf("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\" role=\"img\" aria-label=\"%s\">", doc.Width, doc.Height, doc.Width, doc.Height, html.EscapeString(doc.Title)))
-	buffer.WriteString("<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>")
-	buffer.WriteString(fmt.Sprintf("<text x=\"%.0f\" y=\"20\" font-family=\"sans-serif\" font-size=\"16\" fill=\"#111827\">%s</text>", leftPad, html.EscapeString(doc.Title)))
-	buffer.WriteString(fmt.Sprintf("<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#d1d5db\" stroke-width=\"1\"/>", leftPad, topPad, leftPad, topPad+plotHeight))
-	buffer.WriteString(fmt.Sprintf("<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#d1d5db\" stroke-width=\"1\"/>", leftPad, topPad+plotHeight, leftPad+plotWidth, topPad+plotHeight))
-
-	buffer.WriteString(fmt.Sprintf("<text x=\"8\" y=\"%.2f\" font-family=\"sans-serif\" font-size=\"11\" fill=\"#6b7280\">%s</text>", topPad+8, formatFloat(maxValue)))
-	buffer.WriteString(fmt.Sprintf("<text x=\"8\" y=\"%.2f\" font-family=\"sans-serif\" font-size=\"11\" fill=\"#6b7280\">%s</text>", topPad+plotHeight, formatFloat(minValue)))
-	buffer.WriteString(fmt.Sprintf("<text x=\"%.2f\" y=\"%.2f\" font-family=\"sans-serif\" font-size=\"11\" fill=\"#6b7280\">%d</text>", leftPad, float64(doc.Height)-8, doc.StartAt))
-	buffer.WriteString(fmt.Sprintf("<text x=\"%.2f\" y=\"%.2f\" text-anchor=\"end\" font-family=\"sans-serif\" font-size=\"11\" fill=\"#6b7280\">%d</text>", leftPad+plotWidth, float64(doc.Height)-8, doc.EndAt))
-
-	if !hasData {
-		buffer.WriteString(fmt.Sprintf("<text x=\"%.2f\" y=\"%.2f\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"14\" fill=\"#6b7280\">no data</text>", leftPad+plotWidth/2, topPad+plotHeight/2))
-		buffer.WriteString("</svg>")
-		return buffer.Bytes(), nil
-	}
-
-	for i, series := range doc.Series {
-		if len(series.Values) == 0 {
-			continue
-		}
-
-		color := palette[i%len(palette)]
-		points := make([]string, 0, len(series.Values))
-		for _, point := range series.Values {
-			x := leftPad + ((float64(point.Timestamp)-start)/(end-start))*plotWidth
-			y := topPad + ((maxValue-point.Value)/(maxValue-minValue))*plotHeight
-			points = append(points, formatFloat(x)+","+formatFloat(y))
-		}
-
-		buffer.WriteString(fmt.Sprintf("<polyline fill=\"none\" stroke=\"%s\" stroke-width=\"2\" points=\"%s\"/>", color, html.EscapeString(joinPoints(points))))
-	}
-
-	buffer.WriteString("</svg>")
-	return buffer.Bytes(), nil
+	data := buildMixedSVGData(title, width, height, docs)
+	return executeMixedSVGTemplate(data)
 }
 
 func valueBounds(doc Document) (float64, float64, bool) { // A

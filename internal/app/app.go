@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,13 +24,14 @@ type chartQuerier interface {
 }
 
 type App struct {
-	cfg          config.Config
-	logger       *slog.Logger
-	server       *http.Server
-	querier      chartQuerier
-	chartsByName map[string]config.ChartConfig
-	now          func() time.Time
-	waitUntil    func(ctx context.Context, target time.Time) error
+	cfg               config.Config
+	logger            *slog.Logger
+	server            *http.Server
+	querier           chartQuerier
+	chartsByName      map[string]config.ChartConfig
+	mixedChartsByName map[string]config.MixedChartConfig
+	now               func() time.Time
+	waitUntil         func(ctx context.Context, target time.Time) error
 }
 
 func Run(cfg config.Config) error { // H
@@ -57,10 +59,11 @@ func New(cfg config.Config) (*App, error) { // A
 
 func newApp(cfg config.Config, logger *slog.Logger, querier chartQuerier) *App { // A
 	application := &App{
-		cfg:          cfg,
-		logger:       logger,
-		querier:      querier,
-		chartsByName: indexCharts(cfg.Charts),
+		cfg:               cfg,
+		logger:            logger,
+		querier:           querier,
+		chartsByName:      indexCharts(cfg.Charts),
+		mixedChartsByName: indexMixedCharts(cfg.MixedCharts),
 		now: func() time.Time {
 			return time.Now().UTC()
 		},
@@ -71,6 +74,7 @@ func newApp(cfg config.Config, logger *slog.Logger, querier chartQuerier) *App {
 	mux.HandleFunc("GET /healthz", application.handleHealth)
 	mux.HandleFunc("GET /readyz", application.handleReady)
 	mux.HandleFunc("GET /charts/", application.handleChartRequest)
+	mux.HandleFunc("GET /mixed/", application.handleMixedChartRequest)
 
 	application.server = &http.Server{
 		Addr:              cfg.HTTP.ListenAddr,
@@ -345,4 +349,107 @@ func indexCharts(charts []config.ChartConfig) map[string]config.ChartConfig { //
 		indexed[chart.Name] = chart
 	}
 	return indexed
+}
+
+func indexMixedCharts(mixedCharts []config.MixedChartConfig) map[string]config.MixedChartConfig { // A
+	indexed := make(map[string]config.MixedChartConfig, len(mixedCharts))
+	for _, mc := range mixedCharts {
+		indexed[mc.Name] = mc
+	}
+	return indexed
+}
+
+func (a *App) handleMixedChartRequest(w http.ResponseWriter, r *http.Request) { // A
+	mixedChartName, timestamp, format, ok := parseMixedChartPath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	mc, ok := a.mixedChartsByName[mixedChartName]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	requestedAt, err := a.resolveRequestedTimestamp(r.Context(), timestamp)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		statusCode := http.StatusBadRequest
+		if errors.Is(err, errInvalidGenerationInterval) {
+			statusCode = http.StatusInternalServerError
+		}
+		http.Error(w, err.Error(), statusCode)
+		return
+	}
+
+	docs := make([]charts.Document, 0, len(mc.Charts))
+	for _, chartName := range mc.Charts {
+		chartName = strings.TrimSpace(chartName)
+		chart, ok := a.chartsByName[chartName]
+		if !ok {
+			a.logger.Error("mixed chart references unknown chart", "mixed_chart", mc.Name, "chart", chartName)
+			http.Error(w, "mixed chart references unknown chart", http.StatusInternalServerError)
+			return
+		}
+
+		matrix, qErr := a.querier.QueryChartRange(r.Context(), chart, requestedAt)
+		if qErr != nil {
+			a.logger.Error("query chart range failed", "mixed_chart", mc.Name, "chart", chartName, "requested_at", requestedAt.Unix(), "err", qErr)
+			http.Error(w, "failed to query chart data", http.StatusBadGateway)
+			return
+		}
+
+		docs = append(docs, charts.BuildDocument(chart, requestedAt, matrix))
+	}
+
+	switch format {
+	case "json":
+		body, err := json.Marshal(docs)
+		if err != nil {
+			http.Error(w, "failed to encode mixed chart JSON", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	case "svg":
+		body, err := charts.RenderMixedSVG(mc.Title, mc.Width, mc.Height, docs)
+		if err != nil {
+			http.Error(w, "failed to render mixed chart SVG", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	default:
+		http.Error(w, "unsupported chart format", http.StatusInternalServerError)
+	}
+}
+
+func parseMixedChartPath(path string) (name string, timestamp string, format string, ok bool) { // A
+	trimmed := strings.TrimPrefix(path, "/mixed/")
+	parts := strings.Split(trimmed, "/")
+	switch len(parts) {
+	case 1:
+		name, format, ok = parseChartNameAndFormat(parts[0])
+		if !ok {
+			return "", "", "", false
+		}
+		return name, "", format, true
+	case 2:
+		name = strings.TrimSpace(parts[0])
+		if name == "" {
+			return "", "", "", false
+		}
+		timestamp, format, ok = parseChartNameAndFormat(parts[1])
+		if !ok || timestamp == "" {
+			return "", "", "", false
+		}
+		return name, timestamp, format, true
+	default:
+		return "", "", "", false
+	}
 }
