@@ -1,0 +1,926 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{.Title}}</title>
+        <style>
+            :root {
+                color-scheme: dark;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+                font-family:
+                    system-ui,
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    "Segoe UI",
+                    sans-serif;
+                background: #020617;
+                color: #e2e8f0;
+            }
+
+            main {
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 24px;
+            }
+
+            h1 {
+                margin: 0 0 8px;
+                font-size: 20px;
+                line-height: 1.3;
+            }
+
+            p {
+                margin: 0;
+                color: #94a3b8;
+                line-height: 1.5;
+            }
+
+            .panel {
+                background: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 12px;
+                padding: 16px;
+                box-shadow: none;
+            }
+
+            .panel + .panel {
+                margin-top: 16px;
+            }
+
+            #chart-root {
+                overflow-x: auto;
+            }
+
+            #chart-root svg {
+                display: block;
+                max-width: 100%;
+                height: auto;
+            }
+
+            .status {
+                font-size: 13px;
+                color: #94a3b8;
+            }
+        </style>
+    </head>
+    <body>
+        <main>
+            <section class="panel">
+                <h1>{{.Title}}</h1>
+                <p>
+                    This live view keeps the timestamped <code>.svg</code> and
+                    <code>.json</code> endpoints static and cacheable, then
+                    reveals one synthetic point per second from each 15-second
+                    snapshot interval.
+                </p>
+            </section>
+
+            <section class="panel">
+                <div id="chart-root" aria-live="off"></div>
+            </section>
+
+            <section class="panel status" id="status"></section>
+            <section class="panel status" id="debug-panel" hidden>
+                <strong>Live debug</strong>
+                <pre
+                    id="debug-log"
+                    style="
+                        margin: 12px 0 0;
+                        white-space: pre-wrap;
+                        word-break: break-word;
+                    "
+                ></pre>
+            </section>
+        </main>
+
+        <script>
+            const INITIAL_DOCUMENTS = {{.InitialDocumentsJSON}};
+            const GENERATION_INTERVAL_SECONDS = {{.GenerationIntervalSeconds}};
+            const PLAYBACK_FRAME_INTERVAL_MS = 40;
+            const COUNTER_CORRECTION_GAIN = 0.05;
+            const PALETTE = [
+              "#0ea5e9",
+              "#22c55e",
+              "#f97316",
+              "#a855f7",
+              "#ef4444",
+              "#14b8a6",
+              "#eab308",
+              "#8b5cf6"
+            ];
+
+            const chartRoot = document.getElementById("chart-root");
+            const statusRoot = document.getElementById("status");
+            const debugPanelRoot = document.getElementById("debug-panel");
+            const debugLogRoot = document.getElementById("debug-log");
+            const DEBUG_LIVE_CHART = new URLSearchParams(window.location.search).get("debug") === "1";
+            if (DEBUG_LIVE_CHART) {
+              debugPanelRoot.hidden = false;
+            }
+
+            const state = createState(INITIAL_DOCUMENTS, GENERATION_INTERVAL_SECONDS);
+            const initialStats = computeDisplayedStats(state);
+
+            debugLog("init", {
+              initialDocumentEnds: state.documents.map((document) => document.end_at),
+              revealedTime: state.revealedTime,
+              revealedEndAt: Math.floor(state.revealedTime),
+              latestFetchedEndAt: state.latestFetchedDocument.end_at,
+              nextFetchTimestamp: state.nextFetchTimestamp,
+              currentStats: initialStats.stats.map((stat) => ({
+                name: stat.name,
+                value: stat.value,
+                formatted: stat.formatted
+              })),
+              statWindows: initialStats.debug
+            });
+
+            renderLiveChart(state, initialStats.stats);
+            startPlayback(state);
+            void startFetchLoop(state);
+
+            function createState(documents, generationIntervalSeconds) {
+              const initialDocuments = Array.isArray(documents) ? documents.slice().sort((left, right) => left.end_at - right.end_at) : [];
+              if (initialDocuments.length === 0) {
+                throw new Error("live chart requires at least one initial document");
+              }
+
+              const baseDocument = initialDocuments[0];
+              const seriesByKey = new Map();
+              const seriesOrder = [];
+              const inputSeries = Array.isArray(baseDocument.series) ? baseDocument.series : [];
+
+              for (const series of inputSeries) {
+                const key = metricKey(series.metric);
+                seriesOrder.push(key);
+                seriesByKey.set(key, {
+                  metric: series.metric || {},
+                  history: densifyValues(series.values || [])
+                });
+              }
+
+              const state = {
+                chart: baseDocument.chart,
+                title: baseDocument.title,
+                width: baseDocument.width,
+                height: baseDocument.height,
+                lookbackSeconds: Math.max(1, baseDocument.end_at - baseDocument.start_at),
+                generationIntervalSeconds,
+                revealedTime: baseDocument.end_at,
+                latestFetchedDocument: baseDocument,
+                documents: [baseDocument],
+                nextFetchTimestamp: baseDocument.end_at + generationIntervalSeconds,
+                seriesByKey,
+                seriesOrder,
+                statMetas: new Map(),
+                animatedStatValues: new Map(),
+                lastAnimationAtMs: Date.now(),
+                lastLoggedSecond: Math.floor(baseDocument.end_at)
+              };
+
+              updateStatMetasFromDocument(state, baseDocument);
+              seedAnimatedStatsFromDocument(state, baseDocument);
+
+              for (let index = 1; index < initialDocuments.length; index += 1) {
+                integrateFetchedDocument(state, initialDocuments[index]);
+              }
+
+              state.nextFetchTimestamp = state.latestFetchedDocument.end_at + generationIntervalSeconds;
+              return state;
+            }
+
+            function updateStatMetasFromDocument(state, document) {
+              for (let index = 0; index < (document.stats || []).length; index += 1) {
+                const stat = document.stats[index];
+                state.statMetas.set(statKey(stat, index), {
+                  name: stat.name,
+                  label: stat.label,
+                  decimals: stat.decimals,
+                  unit: stat.unit
+                });
+              }
+            }
+
+            function seedAnimatedStatsFromDocument(state, document) {
+              for (let index = 0; index < (document.stats || []).length; index += 1) {
+                const stat = document.stats[index];
+                state.animatedStatValues.set(statKey(stat, index), stat.value);
+              }
+            }
+
+            function startPlayback(state) {
+              window.setInterval(() => {
+                const nowMs = Date.now();
+                const elapsedSeconds = clamp((nowMs - state.lastAnimationAtMs) / 1000, 0, 0.25);
+                state.lastAnimationAtMs = nowMs;
+
+                if (state.revealedTime < state.latestFetchedDocument.end_at) {
+                  state.revealedTime = Math.min(state.latestFetchedDocument.end_at, state.revealedTime + elapsedSeconds);
+                }
+
+                trimState(state);
+                advanceAnimatedStats(state, elapsedSeconds);
+                const statComputation = computeDisplayedStats(state);
+                const displayedSecond = Math.floor(state.revealedTime);
+                if (displayedSecond !== state.lastLoggedSecond) {
+                  state.lastLoggedSecond = displayedSecond;
+                  debugLog("tick", {
+                    advanced: elapsedSeconds > 0,
+                    revealedTime: state.revealedTime,
+                    revealedEndAt: displayedSecond,
+                    latestFetchedEndAt: state.latestFetchedDocument.end_at,
+                    secondsBuffered: state.latestFetchedDocument.end_at - state.revealedTime,
+                    nextFetchTimestamp: state.nextFetchTimestamp,
+                    documentEnds: state.documents.map((document) => document.end_at),
+                    currentStats: statComputation.stats.map((stat) => ({
+                      name: stat.name,
+                      value: stat.value,
+                      formatted: stat.formatted
+                    })),
+                    statWindows: statComputation.debug
+                  });
+                }
+
+                renderLiveChart(state, statComputation.stats);
+              }, PLAYBACK_FRAME_INTERVAL_MS);
+            }
+
+            async function startFetchLoop(state) {
+              for (;;) {
+                const fetchStartedAt = Date.now();
+                const requestedTimestamp = state.nextFetchTimestamp;
+                debugLog("fetch-start", {
+                  requestedTimestamp,
+                  revealedTime: state.revealedTime,
+                  revealedEndAt: Math.floor(state.revealedTime),
+                  latestFetchedEndAt: state.latestFetchedDocument.end_at,
+                  secondsBuffered: state.latestFetchedDocument.end_at - state.revealedTime
+                });
+
+                try {
+                  const response = await fetch(buildSnapshotURL(state.chart, requestedTimestamp), {
+                    cache: "force-cache"
+                  });
+                  if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                  }
+
+                  const nextDocument = await response.json();
+                  debugLog("fetch-success", {
+                    requestedTimestamp,
+                    receivedEndAt: nextDocument.end_at,
+                    latencyMs: Date.now() - fetchStartedAt
+                  });
+                  integrateFetchedDocument(state, nextDocument);
+                  state.nextFetchTimestamp = nextDocument.end_at + state.generationIntervalSeconds;
+                  renderLiveChart(state, computeDisplayedStats(state).stats);
+                } catch (error) {
+                  debugLog("fetch-failed", {
+                    requestedTimestamp,
+                    latencyMs: Date.now() - fetchStartedAt,
+                    message: error instanceof Error ? error.message : String(error)
+                  });
+                  console.error("fetch next chart snapshot failed", error);
+                  await sleep(1000);
+                }
+              }
+            }
+
+            function buildSnapshotURL(chart, timestamp) {
+              return `/charts/${encodeURIComponent(chart)}/${timestamp}.json`;
+            }
+
+            function integrateFetchedDocument(state, nextDocument) {
+              const previousDocument = state.latestFetchedDocument;
+              const previousSeries = buildActualSeriesMap(previousDocument.series || []);
+              const nextSeries = buildActualSeriesMap(nextDocument.series || []);
+              const keys = new Set([...state.seriesOrder, ...previousSeries.keys(), ...nextSeries.keys()]);
+
+              debugLog("integrate-document", {
+                previousEndAt: previousDocument.end_at,
+                nextEndAt: nextDocument.end_at,
+                previousStats: (previousDocument.stats || []).map((stat) => ({ name: stat.name, value: stat.value })),
+                nextStats: (nextDocument.stats || []).map((stat) => ({ name: stat.name, value: stat.value }))
+              });
+
+              for (const key of keys) {
+                if (!state.seriesByKey.has(key)) {
+                  state.seriesByKey.set(key, {
+                    metric: nextSeries.get(key)?.metric || previousSeries.get(key)?.metric || {},
+                    history: []
+                  });
+                  state.seriesOrder.push(key);
+                }
+
+                const stateSeries = state.seriesByKey.get(key);
+                const previousActual = previousSeries.get(key);
+                const nextActual = nextSeries.get(key);
+
+                if (!stateSeries.metric || Object.keys(stateSeries.metric).length === 0) {
+                  stateSeries.metric = nextActual?.metric || previousActual?.metric || {};
+                }
+
+                if (!previousActual && !nextActual) {
+                  continue;
+                }
+
+                const startTimestamp = previousDocument.end_at;
+                const endTimestamp = nextDocument.end_at;
+                let startValue = previousActual ? previousActual.value : nextActual.value;
+                if (stateSeries.history.length > 0) {
+                  const lastPoint = stateSeries.history[stateSeries.history.length - 1];
+                  if (lastPoint.timestamp === startTimestamp) {
+                    startValue = lastPoint.value;
+                  }
+                }
+                const endValue = nextActual ? nextActual.value : startValue;
+                appendDenseInterval(stateSeries.history, startTimestamp, startValue, endTimestamp, endValue);
+              }
+
+              updateStatMetasFromDocument(state, nextDocument);
+              state.latestFetchedDocument = nextDocument;
+              state.documents.push(nextDocument);
+              state.documents.sort((left, right) => left.end_at - right.end_at);
+            }
+
+            function densifyValues(values) {
+              if (!Array.isArray(values) || values.length === 0) {
+                return [];
+              }
+
+              const dense = [{ timestamp: values[0].timestamp, value: values[0].value }];
+              for (let index = 1; index < values.length; index += 1) {
+                const previous = values[index - 1];
+                const current = values[index];
+                appendDenseInterval(dense, previous.timestamp, previous.value, current.timestamp, current.value);
+              }
+              return dense;
+            }
+
+            function appendDenseInterval(history, startTimestamp, startValue, endTimestamp, endValue) {
+              if (!Number.isFinite(startTimestamp) || !Number.isFinite(endTimestamp) || endTimestamp < startTimestamp) {
+                return;
+              }
+
+              if (history.length === 0) {
+                history.push({ timestamp: startTimestamp, value: startValue });
+              } else {
+                const lastPoint = history[history.length - 1];
+                if (lastPoint.timestamp < startTimestamp) {
+                  history.push({ timestamp: startTimestamp, value: startValue });
+                }
+              }
+
+              if (endTimestamp === startTimestamp) {
+                history[history.length - 1] = { timestamp: endTimestamp, value: endValue };
+                return;
+              }
+
+              let firstTimestamp = startTimestamp + 1;
+              if (history.length > 0) {
+                firstTimestamp = Math.max(firstTimestamp, history[history.length - 1].timestamp + 1);
+              }
+
+              for (let timestamp = firstTimestamp; timestamp <= endTimestamp; timestamp += 1) {
+                const ratio = (timestamp - startTimestamp) / (endTimestamp - startTimestamp);
+                history.push({
+                  timestamp,
+                  value: startValue + (endValue - startValue) * ratio
+                });
+              }
+            }
+
+            function buildActualSeriesMap(seriesList) {
+              const byKey = new Map();
+              for (const series of seriesList) {
+                const values = Array.isArray(series.values) ? series.values : [];
+                if (values.length === 0) {
+                  continue;
+                }
+                const key = metricKey(series.metric);
+                const latestPoint = values[values.length - 1];
+                byKey.set(key, {
+                  metric: series.metric || {},
+                  value: latestPoint.value
+                });
+              }
+              return byKey;
+            }
+
+            function metricKey(metric) {
+              const pairs = Object.entries(metric || {}).sort(([left], [right]) => left.localeCompare(right));
+              if (pairs.length === 0) {
+                return "__default__";
+              }
+              return pairs.map(([key, value]) => `${key}=${value}`).join("|");
+            }
+
+            function trimState(state) {
+              const minimumTimestamp = Math.floor(state.revealedTime) - state.lookbackSeconds - state.generationIntervalSeconds * 2;
+              for (const series of state.seriesByKey.values()) {
+                while (series.history.length > 1 && series.history[1].timestamp < minimumTimestamp) {
+                  series.history.shift();
+                }
+              }
+
+              while (state.documents.length > 2 && state.documents[1].end_at < Math.floor(state.revealedTime) - state.generationIntervalSeconds) {
+                state.documents.shift();
+              }
+            }
+
+            function advanceAnimatedStats(state, elapsedSeconds) {
+              const statKeys = Array.from(state.statMetas.keys());
+              for (const key of statKeys) {
+                const meta = state.statMetas.get(key);
+                if (!meta) {
+                  continue;
+                }
+
+                if (isCounterLikeMeta(meta)) {
+                  const currentValue = state.animatedStatValues.has(key)
+                    ? state.animatedStatValues.get(key)
+                    : evaluateLinearStatValue(state.documents, key, state.revealedTime);
+                  if (!Number.isFinite(currentValue)) {
+                    continue;
+                  }
+
+                  const syntheticRate = computeSyntheticCounterRate(state.documents, key, state.revealedTime);
+                  const rawTarget = evaluateLinearStatValue(state.documents, key, state.revealedTime);
+                  const correctionRate = Number.isFinite(rawTarget) ? (rawTarget - currentValue) * COUNTER_CORRECTION_GAIN : 0;
+                  const appliedRate = Math.max(0, syntheticRate + correctionRate);
+                  state.animatedStatValues.set(key, Math.max(0, currentValue + appliedRate * elapsedSeconds));
+                  continue;
+                }
+
+                const smoothedValue = evaluateSmoothedStatValue(state.documents, key, state.revealedTime);
+                if (Number.isFinite(smoothedValue)) {
+                  state.animatedStatValues.set(key, smoothedValue);
+                }
+              }
+            }
+
+            function renderLiveChart(state, stats) {
+              const document = buildVisibleDocument(state, stats);
+              chartRoot.innerHTML = renderSVG(document);
+              statusRoot.textContent = `displayed end: ${document.end_at} · displayed time: ${state.revealedTime.toFixed(2)} · latest fetched snapshot: ${state.latestFetchedDocument.end_at} · next absolute request: ${state.nextFetchTimestamp}`;
+            }
+
+            function buildVisibleDocument(state, stats) {
+              const endAt = Math.floor(state.revealedTime);
+              const startAt = endAt - state.lookbackSeconds;
+              const visibleSeries = [];
+
+              for (const key of state.seriesOrder) {
+                const source = state.seriesByKey.get(key);
+                if (!source) {
+                  continue;
+                }
+
+                const values = [];
+                for (const point of source.history) {
+                  if (point.timestamp < startAt || point.timestamp > endAt) {
+                    continue;
+                  }
+                  values.push(point);
+                }
+
+                if (values.length === 0) {
+                  continue;
+                }
+
+                visibleSeries.push({
+                  metric: source.metric || {},
+                  values
+                });
+              }
+
+              return {
+                kind: "prometheus_matrix_chart",
+                chart: state.chart,
+                title: state.title,
+                requested_at: endAt,
+                start_at: startAt,
+                end_at: endAt,
+                step_seconds: 1,
+                width: state.width,
+                height: state.height,
+                series: visibleSeries,
+                stats: Array.isArray(stats) ? stats : computeDisplayedStats(state).stats
+              };
+            }
+
+            function computeDisplayedStats(state) {
+              const referenceStats = Array.isArray(state.latestFetchedDocument?.stats) ? state.latestFetchedDocument.stats : [];
+              const stats = [];
+              const debug = [];
+
+              for (let index = 0; index < referenceStats.length; index += 1) {
+                const referenceStat = referenceStats[index];
+                const key = statKey(referenceStat, index);
+                const meta = state.statMetas.get(key) || {
+                  name: referenceStat.name,
+                  label: referenceStat.label,
+                  decimals: referenceStat.decimals,
+                  unit: referenceStat.unit
+                };
+                const windowInfo = describeStatWindow(state.documents, key, state.revealedTime);
+
+                let value = state.animatedStatValues.get(key);
+                if (!Number.isFinite(value)) {
+                  value = isCounterLikeMeta(meta)
+                    ? evaluateLinearStatValue(state.documents, key, state.revealedTime)
+                    : evaluateSmoothedStatValue(state.documents, key, state.revealedTime);
+                }
+                if (!Number.isFinite(value)) {
+                  value = referenceStat.value;
+                }
+
+                const formatted = formatStatValue(value, meta.decimals, meta.unit);
+                stats.push({
+                  name: meta.name,
+                  label: meta.label,
+                  value,
+                  decimals: meta.decimals,
+                  unit: meta.unit,
+                  formatted
+                });
+
+                if (isCounterLikeMeta(meta)) {
+                  debug.push({
+                    name: meta.name,
+                    previousEndAt: windowInfo.previousEndAt,
+                    nextEndAt: windowInfo.nextEndAt,
+                    previousValue: windowInfo.previousValue,
+                    nextValue: windowInfo.nextValue,
+                    ratio: windowInfo.ratio,
+                    linearTargetValue: evaluateLinearStatValue(state.documents, key, state.revealedTime),
+                    syntheticRate: computeSyntheticCounterRate(state.documents, key, state.revealedTime),
+                    displayedValue: value,
+                    formatted,
+                    mode: "animated-counter"
+                  });
+                } else {
+                  debug.push({
+                    name: meta.name,
+                    previousEndAt: windowInfo.previousEndAt,
+                    nextEndAt: windowInfo.nextEndAt,
+                    previousValue: windowInfo.previousValue,
+                    nextValue: windowInfo.nextValue,
+                    ratio: windowInfo.ratio,
+                    smoothedValue: value,
+                    formatted,
+                    mode: "smoothed-stat"
+                  });
+                }
+              }
+
+              return { stats, debug };
+            }
+
+            function describeStatWindow(documents, key, time) {
+              const segment = findDocumentSegment(documents, time);
+              if (!segment) {
+                return {
+                  previousEndAt: null,
+                  nextEndAt: null,
+                  previousValue: null,
+                  nextValue: null,
+                  ratio: 0
+                };
+              }
+
+              const previousStat = getStatFromDocument(segment.left, key);
+              const nextStat = getStatFromDocument(segment.right, key);
+              return {
+                previousEndAt: segment.left?.end_at ?? null,
+                nextEndAt: segment.right?.end_at ?? null,
+                previousValue: previousStat?.value ?? null,
+                nextValue: nextStat?.value ?? previousStat?.value ?? null,
+                ratio: segment.ratio
+              };
+            }
+
+            function findDocumentSegment(documents, time) {
+              if (!Array.isArray(documents) || documents.length === 0) {
+                return null;
+              }
+              if (documents.length === 1) {
+                return {
+                  leftIndex: 0,
+                  rightIndex: 0,
+                  left: documents[0],
+                  right: documents[0],
+                  ratio: 0
+                };
+              }
+
+              for (let index = 0; index < documents.length - 1; index += 1) {
+                const left = documents[index];
+                const right = documents[index + 1];
+                if (time <= right.end_at) {
+                  const span = Math.max(1, right.end_at - left.end_at);
+                  return {
+                    leftIndex: index,
+                    rightIndex: index + 1,
+                    left,
+                    right,
+                    ratio: clamp((time - left.end_at) / span, 0, 1)
+                  };
+                }
+              }
+
+              const lastIndex = documents.length - 1;
+              return {
+                leftIndex: lastIndex,
+                rightIndex: lastIndex,
+                left: documents[lastIndex],
+                right: documents[lastIndex],
+                ratio: 0
+              };
+            }
+
+            function getStatFromDocument(document, key) {
+              const stats = Array.isArray(document?.stats) ? document.stats : [];
+              for (let index = 0; index < stats.length; index += 1) {
+                if (statKey(stats[index], index) === key) {
+                  return stats[index];
+                }
+              }
+              return null;
+            }
+
+            function evaluateLinearStatValue(documents, key, time) {
+              const segment = findDocumentSegment(documents, time);
+              if (!segment) {
+                return NaN;
+              }
+
+              const previousStat = getStatFromDocument(segment.left, key);
+              const nextStat = getStatFromDocument(segment.right, key);
+              if (!previousStat && !nextStat) {
+                return NaN;
+              }
+              if (!nextStat || segment.leftIndex === segment.rightIndex) {
+                return previousStat?.value ?? nextStat?.value ?? NaN;
+              }
+              if (!previousStat) {
+                return nextStat.value;
+              }
+
+              return previousStat.value + (nextStat.value - previousStat.value) * segment.ratio;
+            }
+
+            function evaluateSmoothedStatValue(documents, key, time) {
+              const segment = findDocumentSegment(documents, time);
+              if (!segment) {
+                return NaN;
+              }
+
+              const previousStat = getStatFromDocument(segment.left, key);
+              const nextStat = getStatFromDocument(segment.right, key);
+              if (!previousStat && !nextStat) {
+                return NaN;
+              }
+              if (!nextStat || segment.leftIndex === segment.rightIndex) {
+                return previousStat?.value ?? nextStat?.value ?? NaN;
+              }
+              if (!previousStat) {
+                return nextStat.value;
+              }
+
+              const p0 = getStatFromDocument(documents[Math.max(0, segment.leftIndex - 1)], key)?.value ?? previousStat.value;
+              const p1 = previousStat.value;
+              const p2 = nextStat.value;
+              const p3 = getStatFromDocument(documents[Math.min(documents.length - 1, segment.rightIndex + 1)], key)?.value ?? nextStat.value;
+              const smoothed = catmullRom(p0, p1, p2, p3, segment.ratio);
+              const minValue = Math.min(p0, p1, p2, p3);
+              const maxValue = Math.max(p0, p1, p2, p3);
+              return clamp(smoothed, minValue, maxValue);
+            }
+
+            function computeSyntheticCounterRate(documents, key, time) {
+              const segment = findDocumentSegment(documents, time);
+              if (!segment || segment.leftIndex === segment.rightIndex) {
+                return 0;
+              }
+
+              const currentRate = counterIntervalRate(documents, key, segment.leftIndex, segment.rightIndex);
+              if (currentRate > 0) {
+                return currentRate;
+              }
+
+              const previousRate = segment.leftIndex > 0
+                ? counterIntervalRate(documents, key, segment.leftIndex - 1, segment.leftIndex)
+                : NaN;
+              const nextRate = segment.rightIndex < documents.length - 1
+                ? counterIntervalRate(documents, key, segment.rightIndex, segment.rightIndex + 1)
+                : NaN;
+
+              if (Number.isFinite(previousRate) && previousRate > 0 && Number.isFinite(nextRate) && nextRate > 0) {
+                return previousRate + (nextRate - previousRate) * segment.ratio;
+              }
+              if (Number.isFinite(previousRate) && previousRate > 0) {
+                return previousRate;
+              }
+              if (Number.isFinite(nextRate) && nextRate > 0) {
+                return nextRate;
+              }
+              return 0;
+            }
+
+            function counterIntervalRate(documents, key, fromIndex, toIndex) {
+              if (fromIndex < 0 || toIndex < 0 || fromIndex >= documents.length || toIndex >= documents.length || fromIndex === toIndex) {
+                return NaN;
+              }
+
+              const fromStat = getStatFromDocument(documents[fromIndex], key);
+              const toStat = getStatFromDocument(documents[toIndex], key);
+              if (!fromStat || !toStat || !Number.isFinite(fromStat.value) || !Number.isFinite(toStat.value)) {
+                return NaN;
+              }
+
+              const durationSeconds = documents[toIndex].end_at - documents[fromIndex].end_at;
+              if (durationSeconds <= 0) {
+                return NaN;
+              }
+
+              return Math.max(0, (toStat.value - fromStat.value) / durationSeconds);
+            }
+
+            function catmullRom(p0, p1, p2, p3, ratio) {
+              const u = clamp(ratio, 0, 1);
+              const u2 = u * u;
+              const u3 = u2 * u;
+              return 0.5 * (
+                (2 * p1) +
+                (-p0 + p2) * u +
+                (2 * p0 - 5 * p1 + 4 * p2 - p3) * u2 +
+                (-p0 + 3 * p1 - 3 * p2 + p3) * u3
+              );
+            }
+
+            function debugLog(event, details) {
+              if (!DEBUG_LIVE_CHART) {
+                return;
+              }
+
+              const payload = {
+                event,
+                at: new Date().toISOString(),
+                ...(details || {})
+              };
+              const line = `[prom-live-svg live] ${JSON.stringify(payload)}`;
+              if (debugLogRoot) {
+                debugLogRoot.textContent = `${line}\n${debugLogRoot.textContent}`.slice(0, 24000);
+              }
+              console.debug("[prom-live-svg live]", payload);
+            }
+
+            function statKey(stat, index) {
+              if (stat && typeof stat.name === "string" && stat.name !== "") {
+                return `name:${stat.name}`;
+              }
+              if (stat && typeof stat.label === "string" && stat.label !== "") {
+                return `label:${stat.label}`;
+              }
+              return `index:${index}`;
+            }
+
+            function isCounterLikeMeta(meta) {
+              const unit = typeof meta?.unit === "string" ? meta.unit.trim().toLowerCase() : "";
+              const signature = `${meta?.name || ""} ${meta?.label || ""}`.toLowerCase();
+              return unit === "" && (signature.includes("all_time") || signature.includes("all time") || signature.includes("total"));
+            }
+
+            function formatStatValue(value, decimals, unit) {
+              const safeDecimals = Number.isInteger(decimals) && decimals >= 0 ? decimals : 0;
+              const formatted = Number(value).toFixed(safeDecimals);
+              const trimmedUnit = typeof unit === "string" ? unit.trim() : "";
+              return trimmedUnit === "" ? formatted : `${formatted} ${trimmedUnit}`;
+            }
+
+            function clamp(value, min, max) {
+              return Math.min(max, Math.max(min, value));
+            }
+
+            function renderSVG(document) {
+              const leftPad = 48;
+              const rightPad = 16;
+              const topPad = 32;
+              const bottomPad = 28;
+              const plotWidth = document.width - leftPad - rightPad;
+              const plotHeight = document.height - topPad - bottomPad;
+              const stats = Array.isArray(document.stats) ? document.stats : [];
+              const hasStats = stats.length > 0;
+              const bounds = valueBounds(document.series || []);
+              const minValue = bounds.min;
+              const maxValue = bounds.max;
+              const hasData = bounds.hasData;
+              const startAt = document.start_at;
+              const endAt = startAt === document.end_at ? document.end_at + 1 : document.end_at;
+              const strokeWidth = hasStats ? 3 : 2;
+              const strokeOpacity = hasStats ? 0.18 : 1;
+
+              const seriesMarkup = hasData
+                ? (document.series || []).map((series, index) => {
+                    const color = PALETTE[index % PALETTE.length];
+                    const points = series.values.map((point) => ({
+                      x: leftPad + ((point.timestamp - startAt) / (endAt - startAt)) * plotWidth,
+                      y: topPad + ((maxValue - point.value) / (maxValue - minValue)) * plotHeight
+                    }));
+                    return `<path fill="none" stroke="${color}" stroke-width="${formatFloat(strokeWidth)}" stroke-opacity="${formatFloat(strokeOpacity)}" stroke-linecap="round" stroke-linejoin="round" d="${buildSmoothSVGPath(points)}"/>`;
+                  }).join("")
+                : `<text x="${formatFloat(leftPad + plotWidth / 2)}" y="${formatFloat(topPad + plotHeight / 2)}" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#94a3b8">no data</text>`;
+
+              const statMarkup = hasStats
+                ? stats.map((stat, index) => {
+                    const slotWidth = plotWidth / stats.length;
+                    const x = leftPad + index * slotWidth;
+                    return `<text x="${formatFloat(x)}" y="58.000" font-family="sans-serif" font-size="12" fill="#94a3b8">${escapeXML(stat.label)}</text><text x="${formatFloat(x)}" y="92.000" font-family="sans-serif" font-size="30" font-weight="700" fill="#f8fafc">${escapeXML(stat.formatted)}</text>`;
+                  }).join("")
+                : "";
+
+              return `<svg xmlns="http://www.w3.org/2000/svg" width="${document.width}" height="${document.height}" viewBox="0 0 ${document.width} ${document.height}" role="img" aria-label="${escapeXML(document.title)}"><rect width="100%" height="100%" fill="#020617"/><text x="${formatFloat(leftPad)}" y="20.000" font-family="sans-serif" font-size="16" fill="#f8fafc">${escapeXML(document.title)}</text><line x1="${formatFloat(leftPad)}" y1="${formatFloat(topPad)}" x2="${formatFloat(leftPad)}" y2="${formatFloat(topPad + plotHeight)}" stroke="#334155" stroke-width="1"/><line x1="${formatFloat(leftPad)}" y1="${formatFloat(topPad + plotHeight)}" x2="${formatFloat(leftPad + plotWidth)}" y2="${formatFloat(topPad + plotHeight)}" stroke="#334155" stroke-width="1"/><text x="8" y="${formatFloat(topPad + 8)}" font-family="sans-serif" font-size="11" fill="#94a3b8">${formatFloat(maxValue)}</text><text x="8" y="${formatFloat(topPad + plotHeight)}" font-family="sans-serif" font-size="11" fill="#94a3b8">${formatFloat(minValue)}</text><text x="${formatFloat(leftPad)}" y="${formatFloat(document.height - 8)}" font-family="sans-serif" font-size="11" fill="#94a3b8">${document.start_at}</text><text x="${formatFloat(leftPad + plotWidth)}" y="${formatFloat(document.height - 8)}" text-anchor="end" font-family="sans-serif" font-size="11" fill="#94a3b8">${document.end_at}</text>${seriesMarkup}${statMarkup}</svg>`;
+            }
+
+            function buildSmoothSVGPath(points) {
+              if (!Array.isArray(points) || points.length === 0) {
+                return "";
+              }
+              if (points.length === 1) {
+                return `M ${formatFloat(points[0].x)},${formatFloat(points[0].y)}`;
+              }
+
+              let path = `M ${formatFloat(points[0].x)},${formatFloat(points[0].y)}`;
+              for (let index = 0; index < points.length - 1; index += 1) {
+                const p0 = points[Math.max(0, index - 1)];
+                const p1 = points[index];
+                const p2 = points[index + 1];
+                const p3 = points[Math.min(points.length - 1, index + 2)];
+                const cp1x = p1.x + (p2.x - p0.x) / 6;
+                const cp1y = p1.y + (p2.y - p0.y) / 6;
+                const cp2x = p2.x - (p3.x - p1.x) / 6;
+                const cp2y = p2.y - (p3.y - p1.y) / 6;
+                path += ` C ${formatFloat(cp1x)},${formatFloat(cp1y)} ${formatFloat(cp2x)},${formatFloat(cp2y)} ${formatFloat(p2.x)},${formatFloat(p2.y)}`;
+              }
+
+              return path;
+            }
+
+            function valueBounds(seriesList) {
+              let min = 0;
+              let max = 1;
+              let hasData = false;
+
+              for (const series of seriesList) {
+                for (const point of series.values || []) {
+                  if (!hasData) {
+                    min = point.value;
+                    max = point.value;
+                    hasData = true;
+                    continue;
+                  }
+                  min = Math.min(min, point.value);
+                  max = Math.max(max, point.value);
+                }
+              }
+
+              if (!hasData) {
+                return { min: 0, max: 1, hasData: false };
+              }
+
+              if (min === max) {
+                min -= 1;
+                max += 1;
+              }
+
+              return { min, max, hasData: true };
+            }
+
+            function formatFloat(value) {
+              return Number(value).toFixed(3);
+            }
+
+            function escapeXML(value) {
+              return String(value)
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;")
+                .replaceAll("'", "&#39;");
+            }
+
+            function sleep(milliseconds) {
+              return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+            }
+        </script>
+    </body>
+</html>

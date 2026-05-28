@@ -33,8 +33,8 @@ func TestRenderSVGProducesValidSVGWithFixtureData(t *testing.T) { // A
 	if !strings.Contains(body, "Chrony source offset by source") {
 		t.Fatal("expected SVG to contain chart title")
 	}
-	if !strings.Contains(body, "polyline") {
-		t.Fatal("expected SVG to contain polyline elements for data series")
+	if !strings.Contains(body, "<path ") {
+		t.Fatal("expected SVG to contain path elements for data series")
 	}
 	if !strings.Contains(body, "role=\"img\"") {
 		t.Fatal("expected SVG to have role=\"img\" for accessibility")
@@ -69,8 +69,8 @@ func TestRenderSVGProducesNoDataMessageForEmptySeries(t *testing.T) { // A
 	if !strings.Contains(body, "no data") {
 		t.Fatal("expected SVG to contain 'no data' message for empty series")
 	}
-	if strings.Contains(body, "polyline") {
-		t.Fatal("expected SVG to not contain polyline elements when there is no data")
+	if strings.Contains(body, "<path ") {
+		t.Fatal("expected SVG to not contain path elements when there is no data")
 	}
 }
 
@@ -136,8 +136,8 @@ func TestRenderSVGHandlesSinglePointSeries(t *testing.T) { // A
 	}
 
 	body := string(svg)
-	if !strings.Contains(body, "polyline") {
-		t.Fatal("expected SVG to contain polyline for single point series")
+	if !strings.Contains(body, "<path ") {
+		t.Fatal("expected SVG to contain path for single point series")
 	}
 }
 
@@ -170,8 +170,8 @@ func TestRenderSVGHandlesSameStartEndTimestamps(t *testing.T) { // A
 	}
 
 	body := string(svg)
-	if !strings.Contains(body, "polyline") {
-		t.Fatal("expected SVG to contain polyline when start and end are the same")
+	if !strings.Contains(body, "<path ") {
+		t.Fatal("expected SVG to contain path when start and end are the same")
 	}
 }
 
@@ -206,8 +206,8 @@ func TestRenderSVGHandlesAllSameValues(t *testing.T) { // A
 	}
 
 	body := string(svg)
-	if !strings.Contains(body, "polyline") {
-		t.Fatal("expected SVG to contain polyline for flat line series")
+	if !strings.Contains(body, "<path ") {
+		t.Fatal("expected SVG to contain path for flat line series")
 	}
 }
 
@@ -255,9 +255,9 @@ func TestRenderSVGHandlesMultipleSeries(t *testing.T) { // A
 	}
 
 	body := string(svg)
-	count := strings.Count(body, "<polyline")
+	count := strings.Count(body, "<path ")
 	if count != 3 {
-		t.Fatalf("expected 3 polyline elements, got %d", count)
+		t.Fatalf("expected 3 path elements, got %d", count)
 	}
 }
 

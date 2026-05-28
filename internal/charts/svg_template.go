@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"fmt"
 	"html"
+	"strings"
 	"text/template"
 )
 
@@ -58,9 +59,15 @@ type svgTemplateData struct {
 // svgSeriesData holds the rendering data for a single data series in the SVG.
 type svgSeriesData struct {
 	Color         string
-	Points        string
+	Path          string
 	StrokeWidth   string
 	StrokeOpacity string
+}
+
+// svgPoint holds a single rendered SVG coordinate.
+type svgPoint struct {
+	X float64
+	Y float64
 }
 
 type svgStatData struct {
@@ -162,22 +169,78 @@ func buildSVGSeries(doc Document, start float64, end float64, leftPad float64, t
 		}
 
 		color := palette[i%len(palette)]
-		points := make([]string, 0, len(series.Values))
+		points := make([]svgPoint, 0, len(series.Values))
 		for _, point := range series.Values {
 			x := leftPad + ((float64(point.Timestamp)-start)/(end-start))*plotWidth
 			y := topPad + ((maxValue-point.Value)/(maxValue-minValue))*plotHeight
-			points = append(points, formatFloat(x)+","+formatFloat(y))
+			points = append(points, svgPoint{X: x, Y: y})
 		}
 
 		seriesData = append(seriesData, svgSeriesData{
 			Color:         color,
-			Points:        joinPoints(points),
+			Path:          buildSmoothSVGPath(points),
 			StrokeWidth:   strokeWidth,
 			StrokeOpacity: strokeOpacity,
 		})
 	}
 
 	return seriesData
+}
+
+func buildSmoothSVGPath(points []svgPoint) string { // A
+	if len(points) == 0 {
+		return ""
+	}
+	if len(points) == 1 {
+		return "M " + formatFloat(points[0].X) + "," + formatFloat(points[0].Y)
+	}
+
+	var builder strings.Builder
+	builder.WriteString("M ")
+	builder.WriteString(formatFloat(points[0].X))
+	builder.WriteString(",")
+	builder.WriteString(formatFloat(points[0].Y))
+
+	for i := 0; i < len(points)-1; i++ {
+		p0 := points[maxInt(0, i-1)]
+		p1 := points[i]
+		p2 := points[i+1]
+		p3 := points[minInt(len(points)-1, i+2)]
+
+		cp1X := p1.X + (p2.X-p0.X)/6.0
+		cp1Y := p1.Y + (p2.Y-p0.Y)/6.0
+		cp2X := p2.X - (p3.X-p1.X)/6.0
+		cp2Y := p2.Y - (p3.Y-p1.Y)/6.0
+
+		builder.WriteString(" C ")
+		builder.WriteString(formatFloat(cp1X))
+		builder.WriteString(",")
+		builder.WriteString(formatFloat(cp1Y))
+		builder.WriteString(" ")
+		builder.WriteString(formatFloat(cp2X))
+		builder.WriteString(",")
+		builder.WriteString(formatFloat(cp2Y))
+		builder.WriteString(" ")
+		builder.WriteString(formatFloat(p2.X))
+		builder.WriteString(",")
+		builder.WriteString(formatFloat(p2.Y))
+	}
+
+	return builder.String()
+}
+
+func minInt(left int, right int) int { // A
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func maxInt(left int, right int) int { // A
+	if left > right {
+		return left
+	}
+	return right
 }
 
 // executeSVGTemplate renders the SVG template with the given data and returns the result.
@@ -305,16 +368,18 @@ func buildMixedSVGData(title string, width, height int, docs []Document) mixedCh
 				}
 
 				color := palette[i%len(palette)]
-				points := make([]string, 0, len(series.Values))
+				points := make([]svgPoint, 0, len(series.Values))
 				for _, point := range series.Values {
 					x := leftPad + ((float64(point.Timestamp)-start)/(end-start))*plotWidth
 					y := topPad + ((maxValue-point.Value)/(maxValue-minValue))*perChartPlotHeight
-					points = append(points, formatFloat(x)+","+formatFloat(y))
+					points = append(points, svgPoint{X: x, Y: y})
 				}
 
 				frame.Series = append(frame.Series, svgSeriesData{
-					Color:  color,
-					Points: joinPoints(points),
+					Color:         color,
+					Path:          buildSmoothSVGPath(points),
+					StrokeWidth:   formatFloat(2),
+					StrokeOpacity: formatFloat(1),
 				})
 			}
 		}
@@ -333,7 +398,7 @@ func buildMixedSVGData(title string, width, height int, docs []Document) mixedCh
 func executeMixedSVGTemplate(data mixedChartTemplateData) ([]byte, error) { // A
 	var buffer bytes.Buffer
 	if err := parsedMixedSVGTemplate.Execute(&buffer, data); err != nil {
-		return nil, fmt.Errorf("execute mixed SVG template: %w", err)
+		return nil, fmt.Errorf("execute mixed chart template: %w", err)
 	}
 	return buffer.Bytes(), nil
 }

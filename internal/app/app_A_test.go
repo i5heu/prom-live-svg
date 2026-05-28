@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -105,6 +106,90 @@ func TestHandleChartSVGUsesFixtureData(t *testing.T) { // A
 	}
 	if !strings.Contains(body, "Chrony source offset by source") {
 		t.Fatalf("expected chart title in SVG body, got %q", body)
+	}
+}
+
+func TestHandleLiveChartPageUsesFixtureData(t *testing.T) { // A
+	t.Parallel()
+
+	cfg := loadFixtureConfig(t)
+	querier := newFixtureQuerier(t, fixtureDatasetPath())
+	application := newTestApp(t, cfg, querier)
+
+	request := httptest.NewRequest(http.MethodGet, "/live/chrony_source_offset_by_source/1779896355", nil)
+	response := httptest.NewRecorder()
+
+	application.server.Handler.ServeHTTP(response, request)
+
+	if got, want := response.Code, http.StatusOK; got != want {
+		t.Fatalf("unexpected status: got %d want %d", got, want)
+	}
+	if got, want := response.Header().Get("Content-Type"), "text/html; charset=utf-8"; got != want {
+		t.Fatalf("unexpected content type: got %q want %q", got, want)
+	}
+
+	body := response.Body.String()
+	if !strings.Contains(body, "Chrony source offset by source") {
+		t.Fatalf("expected chart title in live view body, got %q", body)
+	}
+	if !strings.Contains(body, "const INITIAL_DOCUMENTS = ") {
+		t.Fatalf("expected embedded initial documents in live view body, got %q", body)
+	}
+	if !strings.Contains(body, `"chart":"chrony_source_offset_by_source"`) {
+		t.Fatalf("expected embedded chart name in live view body, got %q", body)
+	}
+	if !strings.Contains(body, `"end_at":1779896325`) {
+		t.Fatalf("expected embedded oldest aligned timestamp in live view body, got %q", body)
+	}
+	if !strings.Contains(body, `"end_at":1779896340`) {
+		t.Fatalf("expected embedded previous aligned timestamp in live view body, got %q", body)
+	}
+	if !strings.Contains(body, `"end_at":1779896355`) {
+		t.Fatalf("expected embedded current aligned timestamp in live view body, got %q", body)
+	}
+	if !strings.Contains(body, "/charts/${encodeURIComponent(chart)}/${timestamp}.json") {
+		t.Fatalf("expected live view to fetch timestamped JSON snapshots, got %q", body)
+	}
+	if !strings.Contains(body, "const DEBUG_LIVE_CHART = new URLSearchParams(window.location.search).get(\"debug\") === \"1\";") {
+		t.Fatalf("expected live view to include debug toggle support, got %q", body)
+	}
+}
+
+func TestHandleLiveChartPageWithoutTimestampUsesCurrentAlignedWindow(t *testing.T) { // A
+	t.Parallel()
+
+	cfg := loadFixtureConfig(t)
+	querier := newFixtureQuerier(t, fixtureDatasetPath())
+	application := newTestApp(t, cfg, querier)
+	application.now = func() time.Time { return time.Unix(1779896361, 0).UTC() }
+
+	waitCalled := false
+	application.waitUntil = func(_ context.Context, _ time.Time) error {
+		waitCalled = true
+		return nil
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/live/chrony_packets_accepted", nil)
+	response := httptest.NewRecorder()
+
+	application.server.Handler.ServeHTTP(response, request)
+
+	if got, want := response.Code, http.StatusOK; got != want {
+		t.Fatalf("unexpected status: got %d want %d", got, want)
+	}
+	if waitCalled {
+		t.Fatal("did not expect waitUntil to be called for shorthand latest live chart requests")
+	}
+
+	body := response.Body.String()
+	if !strings.Contains(body, `"end_at":1779896325`) {
+		t.Fatalf("expected embedded oldest aligned timestamp in live view body, got %q", body)
+	}
+	if !strings.Contains(body, `"end_at":1779896340`) {
+		t.Fatalf("expected embedded previous aligned timestamp in live view body, got %q", body)
+	}
+	if !strings.Contains(body, `"end_at":1779896355`) {
+		t.Fatalf("expected embedded aligned timestamp in live view body, got %q", body)
 	}
 }
 
@@ -317,8 +402,20 @@ func TestHandleChartJSONIncludesStats(t *testing.T) { // A
 	if got, want := document.Stats[0].Formatted, "140000"; got != want {
 		t.Fatalf("unexpected formatted total stat on first seeded response: got %q want %q", got, want)
 	}
+	if got, want := document.Stats[0].Decimals, 0; got != want {
+		t.Fatalf("unexpected total stat decimals: got %d want %d", got, want)
+	}
+	if got, want := document.Stats[0].Unit, ""; got != want {
+		t.Fatalf("unexpected total stat unit: got %q want %q", got, want)
+	}
 	if got, want := document.Stats[1].Formatted, "340.51 req/s"; got != want {
 		t.Fatalf("unexpected formatted rate stat: got %q want %q", got, want)
+	}
+	if got, want := document.Stats[1].Decimals, 2; got != want {
+		t.Fatalf("unexpected rate stat decimals: got %d want %d", got, want)
+	}
+	if got, want := document.Stats[1].Unit, "req/s"; got != want {
+		t.Fatalf("unexpected rate stat unit: got %q want %q", got, want)
 	}
 	if got, want := querier.callCount, 4; got != want {
 		t.Fatalf("unexpected querier call count after first response: got %d want %d", got, want)
@@ -364,6 +461,31 @@ func TestHandleChartJSONIncludesStats(t *testing.T) { // A
 	if got, want := querier.queries[5].End.Unix(), int64(1779896370); got != want {
 		t.Fatalf("unexpected persistent delta query end: got %d want %d", got, want)
 	}
+
+	thirdRequest := httptest.NewRequest(http.MethodGet, "/charts/chrony_requests_summary/1779896355.json", nil)
+	thirdResponse := httptest.NewRecorder()
+	application.server.Handler.ServeHTTP(thirdResponse, thirdRequest)
+
+	if got, want := thirdResponse.Code, http.StatusOK; got != want {
+		t.Fatalf("unexpected third status: got %d want %d", got, want)
+	}
+
+	var thirdDocument charts.Document
+	if err := json.Unmarshal(thirdResponse.Body.Bytes(), &thirdDocument); err != nil {
+		t.Fatalf("decode third response JSON: %v", err)
+	}
+	if got, want := thirdDocument.Stats[0].Formatted, "140000"; got != want {
+		t.Fatalf("unexpected formatted total stat on reconstructed historical response: got %q want %q", got, want)
+	}
+	if got, want := querier.callCount, 10; got != want {
+		t.Fatalf("unexpected querier call count after third response: got %d want %d", got, want)
+	}
+	if got, want := querier.queries[8].Start.Unix(), int64(1779896355); got != want {
+		t.Fatalf("unexpected persistent history query start: got %d want %d", got, want)
+	}
+	if got, want := querier.queries[8].End.Unix(), int64(1779896370); got != want {
+		t.Fatalf("unexpected persistent history query end: got %d want %d", got, want)
+	}
 }
 
 func TestHandleChartReturnsNotFoundForUnknownChart(t *testing.T) { // A
@@ -380,6 +502,23 @@ func TestHandleChartReturnsNotFoundForUnknownChart(t *testing.T) { // A
 
 	if got, want := response.Code, http.StatusNotFound; got != want {
 		t.Fatalf("unexpected status: got %d want %d", got, want)
+	}
+}
+
+func TestNewAppServerBaseContextUsesServeContext(t *testing.T) { // A
+	t.Parallel()
+
+	cfg := loadFixtureConfig(t)
+	querier := newFixtureQuerier(t, fixtureDatasetPath())
+	application := newTestApp(t, cfg, querier)
+
+	expectedCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	application.serveContext = expectedCtx
+
+	baseContext := application.server.BaseContext(testListener{})
+	if baseContext != expectedCtx {
+		t.Fatal("expected server BaseContext to return the application's serve context")
 	}
 }
 
@@ -482,4 +621,28 @@ func (f *fixtureQuerier) QueryRange(_ context.Context, query promapi.RangeQuery)
 	}
 
 	return matrix, nil
+}
+
+type testListener struct{}
+
+func (testListener) Accept() (net.Conn, error) { // A
+	return nil, io.EOF
+}
+
+func (testListener) Close() error { // A
+	return nil
+}
+
+func (testListener) Addr() net.Addr { // A
+	return testAddr("test-listener")
+}
+
+type testAddr string
+
+func (a testAddr) Network() string { // A
+	return string(a)
+}
+
+func (a testAddr) String() string { // A
+	return string(a)
 }

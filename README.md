@@ -70,7 +70,7 @@ charts:
         query_file: queries/chrony_packets_accepted.promql
         lookback: 15s
         step: 15s
-        decimals: 2
+        decimals: 0
         unit: req/s
 ```
 
@@ -88,6 +88,11 @@ Shorthand latest endpoints:
 - `/charts/{chart}.json`
 - `/charts/{chart}.svg`
 
+Live HTML view endpoints:
+
+- `/live/{chart}`
+- `/live/{chart}/{unix_timestamp}`
+
 Examples:
 
 ```text
@@ -95,14 +100,22 @@ Examples:
 /charts/chrony_packets_accepted/1779896355.svg
 /charts/chrony_packets_accepted.json
 /charts/chrony_packets_accepted.svg
+/live/chrony_packets_accepted
+/live/chrony_packets_accepted/1779896355
 ```
 
 Behavior:
 
 - timestamps must be aligned to the configured generation interval, e.g. `15s`
 - if a timestamped request targets the next valid quarter-minute and it is still slightly in the future, the server holds the connection until that timestamp is reached
+- on process shutdown, in-flight held requests are canceled via the server base context so `Ctrl+C` can stop the service promptly; if graceful shutdown still times out, the server force-closes active connections
 - if the requested timestamp is more than one generation interval in the future, the request is rejected
 - shorthand endpoints serve the latest aligned chart for the current time
+- live HTML views keep the raw timestamped `.svg` and `.json` endpoints cacheable, but use a small amount of browser-side JavaScript to reveal one interpolated point per second from the already-fetched 15-second snapshots
+- headline stats such as all-time totals and req/s run in an explicit illusion mode at 25 FPS: req/s uses smoothed multi-snapshot tweening, while counter-like totals use synthetic continuously ticking rates with a small correction back toward real snapshot values
+- live HTML views bootstrap with the last three aligned snapshots so the graph and the headline stats animate immediately from first paint and have an extra buffered interval before the next network handoff
+- the live view intentionally stays about two generation intervals behind the freshest fetched snapshot so it can keep animating smoothly even when the next timestamped snapshot arrives a little late
+- append `?debug=1` to a `/live/...` URL to show an on-page live debug panel and emit console logs for tick progression, fetch timing, buffered seconds, loaded document timestamps, and interpolated stat values while debugging stalls
 
 ### Environment overrides
 

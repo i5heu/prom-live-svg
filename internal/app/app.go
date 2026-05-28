@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -34,6 +35,7 @@ type App struct {
 	mixedChartsByName map[string]config.MixedChartConfig
 	now               func() time.Time
 	waitUntil         func(ctx context.Context, target time.Time) error
+	serveContext      context.Context
 }
 
 func Run(cfg config.Config) error { // H
@@ -78,6 +80,7 @@ func newApp(cfg config.Config, logger *slog.Logger, querier chartQuerier) *App {
 		now: func() time.Time {
 			return time.Now().UTC()
 		},
+		serveContext: context.Background(),
 	}
 	application.waitUntil = application.waitForRequestedTimestamp
 
@@ -85,6 +88,7 @@ func newApp(cfg config.Config, logger *slog.Logger, querier chartQuerier) *App {
 	mux.HandleFunc("GET /healthz", application.handleHealth)
 	mux.HandleFunc("GET /readyz", application.handleReady)
 	mux.HandleFunc("GET /charts/", application.handleChartRequest)
+	mux.HandleFunc("GET /live/", application.handleLiveChartRequest)
 	mux.HandleFunc("GET /mixed/", application.handleMixedChartRequest)
 
 	application.server = &http.Server{
@@ -94,6 +98,12 @@ func newApp(cfg config.Config, logger *slog.Logger, querier chartQuerier) *App {
 		ReadTimeout:       cfg.HTTP.ReadTimeout.Duration,
 		WriteTimeout:      cfg.HTTP.WriteTimeout.Duration,
 		IdleTimeout:       cfg.HTTP.IdleTimeout.Duration,
+		BaseContext: func(_ net.Listener) context.Context {
+			if application.serveContext == nil {
+				return context.Background()
+			}
+			return application.serveContext
+		},
 	}
 
 	return application
@@ -102,6 +112,8 @@ func newApp(cfg config.Config, logger *slog.Logger, querier chartQuerier) *App {
 func (a *App) Run() error { // H
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	a.serveContext = ctx
 
 	errCh := make(chan error, 1)
 
@@ -120,11 +132,20 @@ func (a *App) Run() error { // H
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
+		stop()
+
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.HTTP.ShutdownTimeout.Duration)
 		defer cancel()
 
 		a.logger.Info("shutting down HTTP server")
 		if err := a.server.Shutdown(shutdownCtx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				a.logger.Warn("graceful shutdown timed out; forcing HTTP server close")
+				if closeErr := a.server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+					return fmt.Errorf("force close HTTP server after shutdown timeout: %w", closeErr)
+				}
+				return nil
+			}
 			return fmt.Errorf("shutdown HTTP server: %w", err)
 		}
 
@@ -206,6 +227,9 @@ func (a *App) handleChartRequest(w http.ResponseWriter, r *http.Request) { // A
 
 	document, err := a.loadChartDocument(r.Context(), chart, requestedAt)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		a.logger.Error("load chart document failed", "chart", chart.Name, "requested_at", requestedAt.Unix(), "err", err)
 		http.Error(w, "failed to query chart data", http.StatusBadGateway)
 		return
@@ -481,8 +505,32 @@ func (a *App) buildPersistentChartStat(ctx context.Context, chart config.ChartCo
 		return charts.BuildStatFromValue(stat, entry.Total), nil
 	}
 
-	if requestedAt.UTC().Unix() <= entry.LastObservedAt {
-		return charts.BuildStatFromValue(stat, entry.Total), nil
+	requestedAtUnix := requestedAt.UTC().Unix()
+	if requestedAtUnix <= entry.LastObservedAt {
+		if requestedAtUnix == entry.LastObservedAt {
+			return charts.BuildStatFromValue(stat, entry.Total), nil
+		}
+
+		historyMatrix, err := a.querier.QueryRange(ctx, prometheus.RangeQuery{
+			Query: stat.Query,
+			Start: requestedAt,
+			End:   time.Unix(entry.LastObservedAt, 0).UTC(),
+			Step:  step,
+		})
+		if err != nil {
+			return charts.Stat{}, fmt.Errorf("query chart stat %q history: %w", stat.Name, err)
+		}
+
+		delta, _, ok := counterDeltaFromMatrix(historyMatrix)
+		if !ok {
+			return charts.BuildStatFromValue(stat, entry.Total), nil
+		}
+
+		historicalTotal := entry.Total - delta
+		if historicalTotal < 0 {
+			historicalTotal = 0
+		}
+		return charts.BuildStatFromValue(stat, historicalTotal), nil
 	}
 
 	deltaMatrix, err := a.querier.QueryRange(ctx, prometheus.RangeQuery{
@@ -562,6 +610,9 @@ func (a *App) handleMixedChartRequest(w http.ResponseWriter, r *http.Request) { 
 
 		matrix, qErr := a.querier.QueryChartRange(r.Context(), chart, requestedAt)
 		if qErr != nil {
+			if errors.Is(qErr, context.Canceled) || errors.Is(qErr, context.DeadlineExceeded) {
+				return
+			}
 			a.logger.Error("query chart range failed", "mixed_chart", mc.Name, "chart", chartName, "requested_at", requestedAt.Unix(), "err", qErr)
 			http.Error(w, "failed to query chart data", http.StatusBadGateway)
 			return
@@ -569,6 +620,9 @@ func (a *App) handleMixedChartRequest(w http.ResponseWriter, r *http.Request) { 
 
 		stats, statsErr := a.queryChartStats(r.Context(), chart, requestedAt)
 		if statsErr != nil {
+			if errors.Is(statsErr, context.Canceled) || errors.Is(statsErr, context.DeadlineExceeded) {
+				return
+			}
 			a.logger.Error("query chart stats failed", "mixed_chart", mc.Name, "chart", chartName, "requested_at", requestedAt.Unix(), "err", statsErr)
 			http.Error(w, "failed to query chart data", http.StatusBadGateway)
 			return

@@ -36,6 +36,8 @@ type Stat struct {
 	Label     string  `json:"label"`
 	Value     float64 `json:"value"`
 	Formatted string  `json:"formatted"`
+	Decimals  int     `json:"decimals"`
+	Unit      string  `json:"unit"`
 }
 
 type Point struct {
@@ -108,6 +110,8 @@ func BuildStatFromValue(cfg config.ChartStatConfig, value float64) Stat { // A
 		Label:     cfg.Label,
 		Value:     value,
 		Formatted: formatStatValue(value, cfg.Decimals, cfg.Unit),
+		Decimals:  cfg.Decimals,
+		Unit:      cfg.Unit,
 	}
 }
 

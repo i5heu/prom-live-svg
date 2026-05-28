@@ -49,7 +49,7 @@ charts:
             query_file: queries/chrony_packets_accepted.promql
             lookback: 15s
             step: 15s
-            decimals: 2
+            decimals: 0
             unit: req/s
 
     - name: chrony_packets_accepted_inline
