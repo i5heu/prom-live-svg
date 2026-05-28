@@ -150,8 +150,11 @@ func TestHandleLiveChartPageUsesFixtureData(t *testing.T) { // A
 	if !strings.Contains(body, "/charts/${encodeURIComponent(chart)}/${timestamp}.json") {
 		t.Fatalf("expected live view to fetch timestamped JSON snapshots, got %q", body)
 	}
-	if !strings.Contains(body, "const DEBUG_LIVE_CHART = new URLSearchParams(window.location.search).get(\"debug\") === \"1\";") {
+	if !strings.Contains(body, "const DEBUG_LIVE_CHART = params.get(\"debug\") === \"1\";") {
 		t.Fatalf("expected live view to include debug toggle support, got %q", body)
+	}
+	if !strings.Contains(body, "Static SVG embed") || !strings.Contains(body, "Live iframe embed") || !strings.Contains(body, "Live JS embed") {
+		t.Fatalf("expected embed snippets in live view body, got %q", body)
 	}
 }
 
@@ -190,6 +193,101 @@ func TestHandleLiveChartPageWithoutTimestampUsesCurrentAlignedWindow(t *testing.
 	}
 	if !strings.Contains(body, `"end_at":1779896355`) {
 		t.Fatalf("expected embedded aligned timestamp in live view body, got %q", body)
+	}
+}
+
+func TestHandleLiveMixedChartPageUsesFixtureData(t *testing.T) { // A
+	t.Parallel()
+
+	cfg := loadFixtureConfig(t)
+	cfg.MixedCharts = []config.MixedChartConfig{{
+		Name:   "chrony_overview",
+		Title:  "Chrony Overview",
+		Charts: []string{"chrony_packets_accepted", "chrony_source_offset_by_source"},
+		Width:  800,
+		Height: 640,
+	}}
+	querier := newFixtureQuerier(t, fixtureDatasetPath())
+	application := newTestApp(t, cfg, querier)
+
+	request := httptest.NewRequest(http.MethodGet, "/live/mixed/chrony_overview/1779896355", nil)
+	response := httptest.NewRecorder()
+
+	application.server.Handler.ServeHTTP(response, request)
+
+	if got, want := response.Code, http.StatusOK; got != want {
+		t.Fatalf("unexpected status: got %d want %d body=%q", got, want, response.Body.String())
+	}
+	if got, want := response.Header().Get("Content-Type"), "text/html; charset=utf-8"; got != want {
+		t.Fatalf("unexpected content type: got %q want %q", got, want)
+	}
+
+	body := response.Body.String()
+	if !strings.Contains(body, "Chrony Overview") {
+		t.Fatalf("expected mixed chart title in live mixed body, got %q", body)
+	}
+	if !strings.Contains(body, "const INITIAL_SNAPSHOTS = ") {
+		t.Fatalf("expected embedded initial mixed snapshots in body, got %q", body)
+	}
+	if !strings.Contains(body, `"requested_at":1779896325`) {
+		t.Fatalf("expected embedded oldest mixed snapshot timestamp in body, got %q", body)
+	}
+	if !strings.Contains(body, `"requested_at":1779896340`) {
+		t.Fatalf("expected embedded previous mixed snapshot timestamp in body, got %q", body)
+	}
+	if !strings.Contains(body, `"requested_at":1779896355`) {
+		t.Fatalf("expected embedded current mixed snapshot timestamp in body, got %q", body)
+	}
+	if !strings.Contains(body, "/mixed/${encodeURIComponent(MIXED_CHART_NAME)}/${timestamp}.json") {
+		t.Fatalf("expected live mixed page to fetch timestamped mixed JSON snapshots, got %q", body)
+	}
+	if !strings.Contains(body, "Static SVG embed") || !strings.Contains(body, "Live iframe embed") || !strings.Contains(body, "Live JS embed") {
+		t.Fatalf("expected embed snippets in live mixed page body, got %q", body)
+	}
+}
+
+func TestHandleLiveMixedChartPageWithoutTimestampUsesCurrentAlignedWindow(t *testing.T) { // A
+	t.Parallel()
+
+	cfg := loadFixtureConfig(t)
+	cfg.MixedCharts = []config.MixedChartConfig{{
+		Name:   "chrony_overview",
+		Title:  "Chrony Overview",
+		Charts: []string{"chrony_packets_accepted", "chrony_source_offset_by_source"},
+		Width:  800,
+		Height: 640,
+	}}
+	querier := newFixtureQuerier(t, fixtureDatasetPath())
+	application := newTestApp(t, cfg, querier)
+	application.now = func() time.Time { return time.Unix(1779896361, 0).UTC() }
+
+	waitCalled := false
+	application.waitUntil = func(_ context.Context, _ time.Time) error {
+		waitCalled = true
+		return nil
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/live/mixed/chrony_overview", nil)
+	response := httptest.NewRecorder()
+
+	application.server.Handler.ServeHTTP(response, request)
+
+	if got, want := response.Code, http.StatusOK; got != want {
+		t.Fatalf("unexpected status: got %d want %d body=%q", got, want, response.Body.String())
+	}
+	if waitCalled {
+		t.Fatal("did not expect waitUntil to be called for shorthand latest live mixed chart requests")
+	}
+
+	body := response.Body.String()
+	if !strings.Contains(body, `"requested_at":1779896325`) {
+		t.Fatalf("expected embedded oldest mixed snapshot timestamp in body, got %q", body)
+	}
+	if !strings.Contains(body, `"requested_at":1779896340`) {
+		t.Fatalf("expected embedded previous mixed snapshot timestamp in body, got %q", body)
+	}
+	if !strings.Contains(body, `"requested_at":1779896355`) {
+		t.Fatalf("expected embedded current mixed snapshot timestamp in body, got %q", body)
 	}
 }
 

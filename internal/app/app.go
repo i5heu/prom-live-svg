@@ -88,6 +88,7 @@ func newApp(cfg config.Config, logger *slog.Logger, querier chartQuerier) *App {
 	mux.HandleFunc("GET /healthz", application.handleHealth)
 	mux.HandleFunc("GET /readyz", application.handleReady)
 	mux.HandleFunc("GET /charts/", application.handleChartRequest)
+	mux.HandleFunc("GET /live/mixed/", application.handleLiveMixedChartRequest)
 	mux.HandleFunc("GET /live/", application.handleLiveChartRequest)
 	mux.HandleFunc("GET /mixed/", application.handleMixedChartRequest)
 
@@ -598,37 +599,18 @@ func (a *App) handleMixedChartRequest(w http.ResponseWriter, r *http.Request) { 
 		return
 	}
 
-	docs := make([]charts.Document, 0, len(mc.Charts))
-	for _, chartName := range mc.Charts {
-		chartName = strings.TrimSpace(chartName)
-		chart, ok := a.chartsByName[chartName]
-		if !ok {
-			a.logger.Error("mixed chart references unknown chart", "mixed_chart", mc.Name, "chart", chartName)
-			http.Error(w, "mixed chart references unknown chart", http.StatusInternalServerError)
+	docs, err := a.loadMixedChartDocuments(r.Context(), mc, requestedAt)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
-
-		matrix, qErr := a.querier.QueryChartRange(r.Context(), chart, requestedAt)
-		if qErr != nil {
-			if errors.Is(qErr, context.Canceled) || errors.Is(qErr, context.DeadlineExceeded) {
-				return
-			}
-			a.logger.Error("query chart range failed", "mixed_chart", mc.Name, "chart", chartName, "requested_at", requestedAt.Unix(), "err", qErr)
-			http.Error(w, "failed to query chart data", http.StatusBadGateway)
-			return
+		a.logger.Error("load mixed chart documents failed", "mixed_chart", mc.Name, "requested_at", requestedAt.Unix(), "err", err)
+		statusCode := http.StatusBadGateway
+		if strings.Contains(err.Error(), "references unknown chart") {
+			statusCode = http.StatusInternalServerError
 		}
-
-		stats, statsErr := a.queryChartStats(r.Context(), chart, requestedAt)
-		if statsErr != nil {
-			if errors.Is(statsErr, context.Canceled) || errors.Is(statsErr, context.DeadlineExceeded) {
-				return
-			}
-			a.logger.Error("query chart stats failed", "mixed_chart", mc.Name, "chart", chartName, "requested_at", requestedAt.Unix(), "err", statsErr)
-			http.Error(w, "failed to query chart data", http.StatusBadGateway)
-			return
-		}
-
-		docs = append(docs, charts.BuildDocumentWithStats(chart, requestedAt, matrix, stats))
+		http.Error(w, "failed to query chart data", statusCode)
+		return
 	}
 
 	switch format {
@@ -653,6 +635,25 @@ func (a *App) handleMixedChartRequest(w http.ResponseWriter, r *http.Request) { 
 	default:
 		http.Error(w, "unsupported chart format", http.StatusInternalServerError)
 	}
+}
+
+func (a *App) loadMixedChartDocuments(ctx context.Context, mc config.MixedChartConfig, requestedAt time.Time) ([]charts.Document, error) { // A
+	docs := make([]charts.Document, 0, len(mc.Charts))
+	for _, chartName := range mc.Charts {
+		chartName = strings.TrimSpace(chartName)
+		chart, ok := a.chartsByName[chartName]
+		if !ok {
+			return nil, fmt.Errorf("mixed chart references unknown chart %q", chartName)
+		}
+
+		document, err := a.loadChartDocument(ctx, chart, requestedAt)
+		if err != nil {
+			return nil, fmt.Errorf("load chart %q for mixed chart %q: %w", chartName, mc.Name, err)
+		}
+		docs = append(docs, document)
+	}
+
+	return docs, nil
 }
 
 func parseMixedChartPath(path string) (name string, timestamp string, format string, ok bool) { // A
