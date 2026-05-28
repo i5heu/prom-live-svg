@@ -41,6 +41,36 @@ charts:
 
 Use exactly one of `query` or `query_file` per chart.
 
+### Chart HTTP endpoints
+
+The HTTP server now exposes chart endpoints in two formats:
+
+Timestamped endpoints:
+
+- `/charts/{chart}/{unix_timestamp}.json`
+- `/charts/{chart}/{unix_timestamp}.svg`
+
+Shorthand latest endpoints:
+
+- `/charts/{chart}.json`
+- `/charts/{chart}.svg`
+
+Examples:
+
+```text
+/charts/chrony_packets_accepted/1779896355.json
+/charts/chrony_packets_accepted/1779896355.svg
+/charts/chrony_packets_accepted.json
+/charts/chrony_packets_accepted.svg
+```
+
+Behavior:
+
+- timestamps must be aligned to the configured generation interval, e.g. `15s`
+- if a timestamped request targets the next valid quarter-minute and it is still slightly in the future, the server holds the connection until that timestamp is reached
+- if the requested timestamp is more than one generation interval in the future, the request is rejected
+- shorthand endpoints serve the latest aligned chart for the current time
+
 ### Environment overrides
 
 The config loader supports these environment variables:
@@ -65,11 +95,12 @@ The config loader supports these environment variables:
 
 - [x] Golang base structure and configuration system
 - [x] test data and configurations
-- [ ] http server basic setup
-  - [ ] http must hold a connection if it is a valid 1/4 of a minute until the svg or json is available, then it should serve the svg and json charts in said request, so we can handle browsers that have a fast running clock.
+- [x] http server basic setup
+  - [x] http must hold a connection if it is a valid 1/4 of a minute until the svg or json is available, then it should serve the svg and json charts in said request, so we can handle browsers that have a fast running clock.
 - [ ] caching setup for svg and json charts
   - [ ] Multi read and single write lock with fallback for the reads to the previous svg and json charts.
   - [ ] Must cache svg and json for 15 min
+- [ ] SVG renderer with SVG template
 - [ ] Provide prometheus exporter for the service itself so we can monitor requests, query time and draw times.
 
 

@@ -8,16 +8,28 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"prom-live-svg/internal/charts"
 	"prom-live-svg/internal/config"
+	"prom-live-svg/internal/prometheus"
 )
 
+type chartQuerier interface {
+	QueryChartRange(ctx context.Context, chart config.ChartConfig, end time.Time) (prometheus.Matrix, error)
+}
+
 type App struct {
-	cfg    config.Config
-	logger *slog.Logger
-	server *http.Server
+	cfg          config.Config
+	logger       *slog.Logger
+	server       *http.Server
+	querier      chartQuerier
+	chartsByName map[string]config.ChartConfig
+	now          func() time.Time
+	waitUntil    func(ctx context.Context, target time.Time) error
 }
 
 func Run(cfg config.Config) error { // H
@@ -29,20 +41,36 @@ func Run(cfg config.Config) error { // H
 	return application.Run()
 }
 
-func New(cfg config.Config) (*App, error) { // H
+func New(cfg config.Config) (*App, error) { // A
 	logger, err := newLogger(cfg.Service, cfg.Logging)
 	if err != nil {
 		return nil, fmt.Errorf("create logger: %w", err)
 	}
 
-	application := &App{
-		cfg:    cfg,
-		logger: logger,
+	querier, err := prometheus.NewFromConfig(cfg.Prometheus)
+	if err != nil {
+		return nil, fmt.Errorf("create Prometheus client: %w", err)
 	}
 
+	return newApp(cfg, logger, querier), nil
+}
+
+func newApp(cfg config.Config, logger *slog.Logger, querier chartQuerier) *App { // A
+	application := &App{
+		cfg:          cfg,
+		logger:       logger,
+		querier:      querier,
+		chartsByName: indexCharts(cfg.Charts),
+		now: func() time.Time {
+			return time.Now().UTC()
+		},
+	}
+	application.waitUntil = application.waitForRequestedTimestamp
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", application.handleHealth)
-	mux.HandleFunc("/readyz", application.handleReady)
+	mux.HandleFunc("GET /healthz", application.handleHealth)
+	mux.HandleFunc("GET /readyz", application.handleReady)
+	mux.HandleFunc("GET /charts/", application.handleChartRequest)
 
 	application.server = &http.Server{
 		Addr:              cfg.HTTP.ListenAddr,
@@ -53,7 +81,7 @@ func New(cfg config.Config) (*App, error) { // H
 		IdleTimeout:       cfg.HTTP.IdleTimeout.Duration,
 	}
 
-	return application, nil
+	return application
 }
 
 func (a *App) Run() error { // H
@@ -133,4 +161,188 @@ func (a *App) handleReady(w http.ResponseWriter, _ *http.Request) { // H
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ready\n"))
+}
+
+func (a *App) handleChartRequest(w http.ResponseWriter, r *http.Request) { // A
+	chartName, timestamp, format, ok := parseChartPath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	chart, ok := a.chartsByName[chartName]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	requestedAt, err := a.resolveRequestedTimestamp(r.Context(), timestamp)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		statusCode := http.StatusBadRequest
+		if errors.Is(err, errInvalidGenerationInterval) {
+			statusCode = http.StatusInternalServerError
+		}
+		http.Error(w, err.Error(), statusCode)
+		return
+	}
+
+	matrix, err := a.querier.QueryChartRange(r.Context(), chart, requestedAt)
+	if err != nil {
+		a.logger.Error("query chart range failed", "chart", chart.Name, "requested_at", requestedAt.Unix(), "err", err)
+		http.Error(w, "failed to query chart data", http.StatusBadGateway)
+		return
+	}
+
+	document := charts.BuildDocument(chart, requestedAt, matrix)
+
+	switch format {
+	case "json":
+		body, err := charts.MarshalJSON(document)
+		if err != nil {
+			http.Error(w, "failed to encode chart JSON", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	case "svg":
+		body, err := charts.RenderSVG(document)
+		if err != nil {
+			http.Error(w, "failed to render chart SVG", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	default:
+		http.Error(w, "unsupported chart format", http.StatusInternalServerError)
+	}
+}
+
+var errInvalidGenerationInterval = errors.New("generation interval must be a positive whole number of seconds")
+
+func (a *App) resolveRequestedTimestamp(ctx context.Context, raw string) (time.Time, error) { // A
+	if strings.TrimSpace(raw) == "" {
+		return a.currentAlignedTimestamp()
+	}
+
+	requestedAt, err := a.parseRequestedTimestamp(raw)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	if err := a.waitUntil(ctx, requestedAt); err != nil {
+		return time.Time{}, err
+	}
+
+	return requestedAt, nil
+}
+
+func (a *App) parseRequestedTimestamp(raw string) (time.Time, error) { // A
+	timestamp, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("timestamp must be a unix time in seconds")
+	}
+
+	intervalSeconds, err := a.generationIntervalSeconds()
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	if timestamp%intervalSeconds != 0 {
+		return time.Time{}, fmt.Errorf("timestamp must align to the %d-second generation interval", intervalSeconds)
+	}
+
+	return time.Unix(timestamp, 0).UTC(), nil
+}
+
+func (a *App) currentAlignedTimestamp() (time.Time, error) { // A
+	intervalSeconds, err := a.generationIntervalSeconds()
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	now := a.now().UTC().Unix()
+	aligned := now - (now % intervalSeconds)
+	return time.Unix(aligned, 0).UTC(), nil
+}
+
+func (a *App) generationIntervalSeconds() (int64, error) { // A
+	interval := a.cfg.Generation.Interval.Duration
+	if interval <= 0 || interval%time.Second != 0 {
+		return 0, errInvalidGenerationInterval
+	}
+	return int64(interval / time.Second), nil
+}
+
+func parseChartPath(path string) (chart string, timestamp string, format string, ok bool) { // A
+	trimmed := strings.TrimPrefix(path, "/charts/")
+	parts := strings.Split(trimmed, "/")
+	switch len(parts) {
+	case 1:
+		chart, format, ok = parseChartNameAndFormat(parts[0])
+		if !ok {
+			return "", "", "", false
+		}
+		return chart, "", format, true
+	case 2:
+		chart = strings.TrimSpace(parts[0])
+		if chart == "" {
+			return "", "", "", false
+		}
+		timestamp, format, ok = parseChartNameAndFormat(parts[1])
+		if !ok || timestamp == "" {
+			return "", "", "", false
+		}
+		return chart, timestamp, format, true
+	default:
+		return "", "", "", false
+	}
+}
+
+func parseChartNameAndFormat(raw string) (name string, format string, ok bool) { // A
+	trimmed := strings.TrimSpace(raw)
+	switch {
+	case strings.HasSuffix(trimmed, ".json"):
+		name = strings.TrimSuffix(trimmed, ".json")
+		return strings.TrimSpace(name), "json", strings.TrimSpace(name) != ""
+	case strings.HasSuffix(trimmed, ".svg"):
+		name = strings.TrimSuffix(trimmed, ".svg")
+		return strings.TrimSpace(name), "svg", strings.TrimSpace(name) != ""
+	default:
+		return "", "", false
+	}
+}
+
+func (a *App) waitForRequestedTimestamp(ctx context.Context, target time.Time) error { // A
+	now := a.now().UTC()
+	if !target.After(now) {
+		return nil
+	}
+
+	waitDuration := target.Sub(now)
+	if waitDuration > a.cfg.Generation.Interval.Duration {
+		return fmt.Errorf("timestamp is more than one generation interval in the future")
+	}
+
+	timer := time.NewTimer(waitDuration)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func indexCharts(charts []config.ChartConfig) map[string]config.ChartConfig { // A
+	indexed := make(map[string]config.ChartConfig, len(charts))
+	for _, chart := range charts {
+		indexed[chart.Name] = chart
+	}
+	return indexed
 }
